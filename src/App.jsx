@@ -41,7 +41,11 @@ function safeParseJSON(raw) {
 }
 
 async function callGemini(system, userText) {
-  const response = await fetch("http://localhost:3001/api/gemini", {
+  const geminiUrl = import.meta.env.DEV
+  ? "http://localhost:3001/api/gemini"
+  : "/api/gemini";
+
+  const response = await fetch(geminiUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
