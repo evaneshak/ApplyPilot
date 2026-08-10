@@ -45,8 +45,12 @@ app.post("/api/gemini", async (req, res) => {
   }
 });
 
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 
-app.listen(PORT, () => {
-  console.log(`ApplyPilot server running on http://localhost:${PORT}`);
-});
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`ApplyPilot server running on http://localhost:${PORT}`);
+  });
+}
+
+export default app;
