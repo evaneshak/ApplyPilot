@@ -42,8 +42,8 @@ function safeParseJSON(raw) {
 
 async function callGemini(system, userText) {
   const geminiUrl = import.meta.env.DEV
-  ? "http://localhost:3001/api/gemini"
-  : "/api/gemini";
+    ? "http://localhost:3001/api/gemini"
+    : "/api/gemini";
 
   const response = await fetch(geminiUrl, {
     method: "POST",
@@ -53,7 +53,7 @@ async function callGemini(system, userText) {
     body: JSON.stringify({
       system,
       userText,
-    }),callGemini
+    }),
   });
 
   if (!response.ok) {
@@ -136,7 +136,7 @@ export default function App() {
   const [selectedId, setSelectedId] = useState(null);
 
   /* ---- load persisted state ---- */
-useEffect(() => {
+  useEffect(() => {
   try {
     const apps = localStorage.getItem("applications");
     if (apps) {
@@ -169,7 +169,7 @@ const persistApplications = useCallback((next) => {
   }
 }, [pushToast]);
 
-const persistResume = useCallback((next) => {
+  const persistResume = useCallback((next) => {
   setResume(next);
 
   try {
@@ -436,7 +436,13 @@ function AddFlight({ resumeText, onAdd, onCancel, pushToast }) {
             <Field label="Position" value={draft.position} onChange={(v) => setDraft({ ...draft, position: v })} />
             <Field label="Location" value={draft.location} onChange={(v) => setDraft({ ...draft, location: v })} icon={<MapPin size={12} />} />
             <Field label="Salary" value={draft.salary} onChange={(v) => setDraft({ ...draft, salary: v })} icon={<DollarSign size={12} />} />
-            <Field label="Deadline" value={draft.deadline} onChange={(v) => setDraft({ ...draft, deadline: v })} icon={<CalendarClock size={12} />} />
+            <Field
+              label="Deadline"
+              type="date"
+              value={draft.deadline}
+              onChange={(v) => setDraft({ ...draft, deadline: v })}
+              icon={<CalendarClock size={12} />}
+            />
           </div>
 
           <div className="skills-block">
@@ -479,12 +485,13 @@ function AddFlight({ resumeText, onAdd, onCancel, pushToast }) {
   );
 }
 
-function Field({ label, value, onChange, icon }) {
+function Field({ label, value, onChange, icon, type = "text" }) {
   return (
     <label className="field">
       <span className="mini-label">{icon} {label}</span>
       <input
         className="input"
+        type={type}
         value={value || ""}
         onChange={(e) => onChange(e.target.value)}
         placeholder="Not found"
@@ -501,19 +508,19 @@ function ResumeView({ resume, onSave, pushToast, onRecalculate }) {
   useEffect(() => setText(resume.text || ""), [resume.text]);
 
   const save = async () => {
-  setSaving(true);
+    setSaving(true);
 
-  const success = await onSave({
-    text,
-    updatedAt: Date.now(),
-  });
+    const success = await onSave({
+      text,
+      updatedAt: Date.now(),
+    });
 
-  setSaving(false);
+    setSaving(false);
 
-  if (success !== false) {
-    pushToast("Resume saved.", "success");
-  }
-};
+    if (success !== false) {
+      pushToast("Resume saved.", "success");
+    }
+  };
 
   return (
     <div className="panel">
