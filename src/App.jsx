@@ -4,6 +4,7 @@ import {
   Loader2, Trash2, RefreshCw, FileText, MapPin,
   DollarSign, CalendarClock, ArrowLeft, AlertCircle, Wand2
 } from "lucide-react";
+import { supabase } from "./supabase";
 
 /* ---------------------------------------------------------------
    ApplyPilot — mission control for a job search.
@@ -135,79 +136,194 @@ export default function App() {
   const [toasts, pushToast] = useToasts();
   const [selectedId, setSelectedId] = useState(null);
 
-  /* ---- load persisted state ---- */
-  useEffect(() => {
-  try {
-    const apps = localStorage.getItem("applications");
-    if (apps) {
-      setApplications(JSON.parse(apps));
-    }
-  } catch (e) {
-    console.error("Failed to load applications:", e);
-  }
+  const [session, setSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
 
+  /* ---- Supabase authentication session ---- */
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      setAuthLoading(false);
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, []);
+
+
+/* ---- load applications from Supabase ---- */
+useEffect(() => {
+  if (!session?.user?.id) return;
+
+  const loadSupabaseApplications = async () => {
+    setLoaded(false);
+
+    const { data, error } = await supabase
+      .from("Applications")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("Supabase Applications load failed:", error);
+      pushToast("Couldn't load applications.", "error");
+      setLoaded(true);
+      return;
+    }
+
+    const formatted = (data || []).map((app) => ({
+      id: app.id,
+      company: app.company,
+      position: app.position,
+      location: app.location,
+      salary: app.salary,
+      deadline: app.deadline,
+      status: app.status,
+      skills: app.skills || [],
+      rawText: app.raw_text,
+      match: app.match,
+      have: app.have || [],
+      missing: app.missing || [],
+      suggestions: app.suggestions || [],
+      questions: app.questions || [],
+      createdAt: app.created_at,
+    }));
+
+    setApplications(formatted);
+    setLoaded(true);
+  };
+
+  loadSupabaseApplications();
+}, [session, pushToast]);
+
+
+/* ---- load persisted resume ---- */
+useEffect(() => {
   try {
     const savedResume = localStorage.getItem("resume");
+
     if (savedResume) {
       setResume(JSON.parse(savedResume));
     }
   } catch (e) {
     console.error("Failed to load resume:", e);
   }
-
-  setLoaded(true);
 }, []);
 
-const persistApplications = useCallback((next) => {
-  setApplications(next);
+const persistApplications = useCallback(
+  (next) => {
+    setApplications(next);
 
-  try {
-    localStorage.setItem("applications", JSON.stringify(next));
-  } catch (e) {
-    console.error("Failed to save applications:", e);
-    pushToast("Couldn't save — your changes may not persist.", "error");
-  }
-}, [pushToast]);
+    try {
+      localStorage.setItem("applications", JSON.stringify(next));
+    } catch (e) {
+      console.error("Failed to save applications:", e);
+      pushToast("Couldn't save — your changes may not persist.", "error");
+    }
+  },
+  [pushToast]
+);
 
-  const persistResume = useCallback((next) => {
-  setResume(next);
+const persistResume = useCallback(
+  (next) => {
+    setResume(next);
 
-  try {
-    localStorage.setItem("resume", JSON.stringify(next));
-  } catch (e) {
-    console.error("Failed to save resume:", e);
-    pushToast("Couldn't save your resume.", "error");
-    return false;
-  }
+    try {
+      localStorage.setItem("resume", JSON.stringify(next));
+    } catch (e) {
+      console.error("Failed to save resume:", e);
+      pushToast("Couldn't save your resume.", "error");
+      return false;
+    }
 
-  return true;
-}, [pushToast]);
+    return true;
+  },
+  [pushToast]
+);
 
-  const addApplication = useCallback((app) => {
-    const next = [{ ...app, id: uid(), status: "saved", createdAt: Date.now() }, ...applications];
-    persistApplications(next);
-    pushToast("Flight logged: " + app.company + " — " + app.position, "success");
+const addApplication = useCallback(
+  async (app) => {
+    if (!session?.user?.id) {
+      pushToast("You must be logged in to save an application.", "error");
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("Applications")
+      .insert({
+        user_id: session.user.id,
+        company: app.company,
+        position: app.position,
+        location: app.location,
+        salary: app.salary,
+        deadline: app.deadline || null,
+        status: "saved",
+        skills: app.skills || [],
+        raw_text: app.rawText || null,
+        match: app.match ?? null,
+        have: app.have || [],
+        missing: app.missing || [],
+        suggestions: app.suggestions || [],
+        questions: app.questions || [],
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error("Supabase insert failed:", error);
+      pushToast("Couldn't save application.", "error");
+      return;
+    }
+
+    console.log("Supabase application created:", data);
+
+    pushToast(
+      "Flight logged: " + app.company + " — " + app.position,
+      "success"
+    );
+
     setView("dashboard");
-  }, [applications, persistApplications, pushToast]);
+  },
+  [session, pushToast]
+);
 
-  const updateApplication = useCallback((id, patch) => {
-    const next = applications.map((a) => (a.id === id ? { ...a, ...patch } : a));
-    persistApplications(next);
-  }, [applications, persistApplications]);
+const selected =
+  applications.find((a) => a.id === selectedId) || null;
 
-  const deleteApplication = useCallback((id) => {
-    const next = applications.filter((a) => a.id !== id);
-    persistApplications(next);
-    setSelectedId(null);
-    pushToast("Flight removed.", "info");
-  }, [applications, persistApplications, pushToast]);
+  /* ---- authentication gate ---- */
+  if (authLoading) {
+    return (
+      <div className="app">
+        <Style />
+        <div className="loading-screen">
+          <Loader2 className="spin" size={22} />
+          <span>Checking flight credentials…</span>
+        </div>
+      </div>
+    );
+  }
 
-  const selected = applications.find((a) => a.id === selectedId) || null;
+  if (!session) {
+    return (
+      <div className="app">
+        <Style />
+        <AuthView pushToast={pushToast} />
+        <Toasts toasts={toasts} />
+      </div>
+    );
+  }
 
   return (
     <div className="app">
       <Style />
       <TopBar view={view} setView={setView} />
+
       <main className="main">
         {!loaded ? (
           <div className="loading-screen">
@@ -229,18 +345,45 @@ const persistApplications = useCallback((next) => {
             pushToast={pushToast}
           />
         ) : (
-          <ResumeView resume={resume} onSave={persistResume} pushToast={pushToast}
+          <ResumeView
+            resume={resume}
+            onSave={persistResume}
+            pushToast={pushToast}
             onRecalculate={async () => {
-              if (!resume.text) { pushToast("Add a resume first.", "error"); return; }
+              if (!resume.text) {
+                pushToast("Add a resume first.", "error");
+                return;
+              }
+
               pushToast("Recalculating matches…", "info");
+
               const next = [];
+
               for (const a of applications) {
                 try {
-                  const raw = await callGemini(MATCH_SYSTEM, matchUserPrompt(a, resume.text));
+                  const raw = await callGemini(
+                    MATCH_SYSTEM,
+                    matchUserPrompt(a, resume.text)
+                  );
+
                   const parsed = safeParseJSON(raw);
-                  next.push(parsed ? { ...a, match: parsed.match, have: parsed.have, missing: parsed.missing, suggestions: parsed.suggestions } : a);
-                } catch (e) { next.push(a); }
+
+                  next.push(
+                    parsed
+                      ? {
+                          ...a,
+                          match: parsed.match,
+                          have: parsed.have,
+                          missing: parsed.missing,
+                          suggestions: parsed.suggestions,
+                        }
+                      : a
+                  );
+                } catch (e) {
+                  next.push(a);
+                }
               }
+
               persistApplications(next);
               pushToast("Matches updated.", "success");
             }}
@@ -253,9 +396,13 @@ const persistApplications = useCallback((next) => {
           app={selected}
           resumeText={resume.text}
           onClose={() => setSelectedId(null)}
-          onStatusChange={(s) => updateApplication(selected.id, { status: s })}
+          onStatusChange={(s) =>
+            updateApplication(selected.id, { status: s })
+          }
           onDelete={() => deleteApplication(selected.id)}
-          onQuestions={(q) => updateApplication(selected.id, { questions: q })}
+          onQuestions={(q) =>
+            updateApplication(selected.id, { questions: q })
+          }
           pushToast={pushToast}
         />
       )}
@@ -265,6 +412,132 @@ const persistApplications = useCallback((next) => {
   );
 }
 
+function AuthView({ pushToast }) {
+  const [mode, setMode] = useState("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+
+    if (!email.trim() || !password.trim()) {
+      pushToast("Enter your email and password.", "error");
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      if (mode === "signup") {
+        const { error } = await supabase.auth.signUp({
+          email,
+          password,
+        });
+
+        if (error) throw error;
+
+        pushToast(
+          "Account created. Check your email if confirmation is required.",
+          "success"
+        );
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({
+          email,
+          password,
+        });
+
+        if (error) throw error;
+
+        pushToast("Welcome back.", "success");
+      }
+    } catch (error) {
+      pushToast(error.message || "Authentication failed.", "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="auth-screen">
+      <div className="auth-card">
+        <div className="brand auth-brand">
+          <span className="brand-mark">
+            <Plane size={18} />
+          </span>
+
+          <div className="brand-text">
+            <span className="brand-name">ApplyPilot</span>
+            <span className="brand-tag">
+              MISSION CONTROL FOR YOUR JOB SEARCH
+            </span>
+          </div>
+        </div>
+
+        <h1 className="auth-title">
+          {mode === "login" ? "Welcome back" : "Create your account"}
+        </h1>
+
+        <p className="auth-sub">
+          {mode === "login"
+            ? "Sign in to access your applications and resume."
+            : "Create an account to start tracking your job search."}
+        </p>
+
+        <form onSubmit={submit}>
+          <label className="field">
+            <span className="mini-label">Email</span>
+            <input
+              className="input"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@example.com"
+            />
+          </label>
+
+          <label className="field auth-password">
+            <span className="mini-label">Password</span>
+            <input
+              className="input"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="••••••••"
+            />
+          </label>
+
+          <button
+            className="btn btn-primary auth-submit"
+            type="submit"
+            disabled={loading}
+          >
+            {loading && <Loader2 className="spin" size={16} />}
+            {mode === "login" ? "Sign in" : "Create account"}
+          </button>
+        </form>
+
+        <button
+          className="auth-switch"
+          type="button"
+          onClick={() =>
+            setMode((current) =>
+              current === "login" ? "signup" : "login"
+            )
+          }
+        >
+          {mode === "login"
+            ? "Need an account? Sign up"
+            : "Already have an account? Sign in"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+
+
 /* --------------------------- top bar ---------------------------- */
 function TopBar({ view, setView }) {
   const tabs = [
@@ -272,26 +545,50 @@ function TopBar({ view, setView }) {
     { id: "add", label: "Log Application" },
     { id: "resume", label: "Resume" },
   ];
+
+  const handleLogout = async () => {
+    const { error } = await supabase.auth.signOut();
+
+    if (error) {
+      console.error("Logout failed:", error);
+    }
+  };
+
   return (
     <header className="topbar">
       <div className="brand">
-        <span className="brand-mark"><Plane size={18} /></span>
+        <span className="brand-mark">
+          <Plane size={18} />
+        </span>
+
         <div className="brand-text">
           <span className="brand-name">ApplyPilot</span>
-          <span className="brand-tag">MISSION CONTROL FOR YOUR JOB SEARCH</span>
+          <span className="brand-tag">
+            MISSION CONTROL FOR YOUR JOB SEARCH
+          </span>
         </div>
       </div>
-      <nav className="nav">
-        {tabs.map((t) => (
-          <button
-            key={t.id}
-            className={"navbtn" + (view === t.id ? " active" : "")}
-            onClick={() => setView(t.id)}
-          >
-            {t.label}
-          </button>
-        ))}
-      </nav>
+
+      <div className="topbar-actions">
+        <nav className="nav">
+          {tabs.map((t) => (
+            <button
+              key={t.id}
+              className={"navbtn" + (view === t.id ? " active" : "")}
+              onClick={() => setView(t.id)}
+            >
+              {t.label}
+            </button>
+          ))}
+        </nav>
+
+        <button
+          className="btn btn-ghost logout-btn"
+          onClick={handleLogout}
+        >
+          Log out
+        </button>
+      </div>
     </header>
   );
 }
@@ -902,6 +1199,20 @@ function Style() {
       .brand-name{font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:19px; letter-spacing:.2px;}
       .brand-tag{font-family:'JetBrains Mono',monospace; font-size:9.5px; letter-spacing:1.4px; color:var(--muted);}
       .nav{display:flex; gap:6px; background:var(--panel); padding:4px; border-radius:10px; border:1px solid var(--border);}
+
+      .topbar-actions{
+        display:flex; 
+        align-items:center;
+        gap:10px;
+      }
+
+      .logout-btn{
+        padding:8px 12px;
+        white-space:nowrap;
+      }
+
+
+
 
       .navbtn{
         background:transparent;
