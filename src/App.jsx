@@ -203,49 +203,82 @@ useEffect(() => {
 }, [session, pushToast]);
 
 
-/* ---- load persisted resume ---- */
+/* ---- load resume from Supabase ---- */
 useEffect(() => {
-  try {
-    const savedResume = localStorage.getItem("resume");
+  if (!session?.user?.id) return;
 
-    if (savedResume) {
-      setResume(JSON.parse(savedResume));
+  const loadSupabaseResume = async () => {
+    const { data, error } = await supabase
+      .from("Resumes")
+      .select("*")
+      .eq("user_id", session.user.id)
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.error("Supabase resume load failed:", error);
+      pushToast("Couldn't load your resume.", "error");
+      return;
     }
-  } catch (e) {
-    console.error("Failed to load resume:", e);
-  }
-}, []);
 
-const persistApplications = useCallback(
-  (next) => {
-    setApplications(next);
-
-    try {
-      localStorage.setItem("applications", JSON.stringify(next));
-    } catch (e) {
-      console.error("Failed to save applications:", e);
-      pushToast("Couldn't save — your changes may not persist.", "error");
+    if (data) {
+      setResume({
+        text: data.text || "",
+        updatedAt: data.updated_at,
+      });
+    } else {
+      setResume({
+        text: "",
+        updatedAt: null,
+      });
     }
-  },
-  [pushToast]
-);
+  };
+
+  loadSupabaseResume();
+}, [session, pushToast]);
+
 
 const persistResume = useCallback(
-  (next) => {
-    setResume(next);
+  async (next) => {
+    if (!session?.user?.id) {
+      pushToast("You must be logged in to save your resume.", "error");
+      return false;
+    }
 
-    try {
-      localStorage.setItem("resume", JSON.stringify(next));
-    } catch (e) {
-      console.error("Failed to save resume:", e);
+    const updatedAt = new Date().toISOString();
+
+    const { error } = await supabase
+      .from("Resumes")
+      .upsert(
+        {
+          user_id: session.user.id,
+          text: next.text,
+          updated_at: updatedAt,
+        },
+        {
+          onConflict: "user_id",
+        }
+      );
+
+    if (error) {
+      console.error("Supabase resume save failed:", error);
       pushToast("Couldn't save your resume.", "error");
       return false;
     }
 
+    setResume({
+      text: next.text,
+      updatedAt,
+    });
+
+    console.log("Resume saved to Supabase.");
+
     return true;
   },
-  [pushToast]
+  [session, pushToast]
 );
+
+
 
 const addApplication = useCallback(
   async (app) => {
@@ -293,124 +326,228 @@ const addApplication = useCallback(
   [session, pushToast]
 );
 
+const updateApplication = useCallback(
+  async (id, patch) => {
+    if (!session?.user?.id) {
+      pushToast("You must be logged in to update an application.", "error");
+      return;
+    }
+
+    // Update the ApplyPilot UI immediately
+    setApplications((current) =>
+      current.map((app) =>
+        app.id === id
+          ? {
+              ...app,
+              ...patch,
+            }
+          : app
+      )
+    );
+
+    const dbPatch = {};
+
+    if (patch.company !== undefined) dbPatch.company = patch.company;
+    if (patch.position !== undefined) dbPatch.position = patch.position;
+    if (patch.location !== undefined) dbPatch.location = patch.location;
+    if (patch.salary !== undefined) dbPatch.salary = patch.salary;
+    if (patch.deadline !== undefined) dbPatch.deadline = patch.deadline || null;
+    if (patch.status !== undefined) dbPatch.status = patch.status;
+    if (patch.skills !== undefined) dbPatch.skills = patch.skills;
+    if (patch.rawText !== undefined) dbPatch.raw_text = patch.rawText;
+    if (patch.match !== undefined) dbPatch.match = patch.match;
+    if (patch.have !== undefined) dbPatch.have = patch.have;
+    if (patch.missing !== undefined) dbPatch.missing = patch.missing;
+    if (patch.suggestions !== undefined) dbPatch.suggestions = patch.suggestions;
+    if (patch.questions !== undefined) dbPatch.questions = patch.questions;
+
+    const { error } = await supabase
+      .from("Applications")
+      .update(dbPatch)
+      .eq("id", id)
+      .eq("user_id", session.user.id);
+
+    if (error) {
+      console.error("Supabase update failed:", error);
+      pushToast("Couldn't update application.", "error");
+      return;
+    }
+
+    console.log("Supabase application updated:", id, patch);
+  },
+  [session, pushToast]
+);
+
+const deleteApplication = useCallback(
+  async (id) => {
+    if (!session?.user?.id) {
+      pushToast("You must be logged in to delete an application.", "error");
+      return;
+    }
+
+    const { error } = await supabase
+      .from("Applications")
+      .delete()
+      .eq("id", id)
+      .eq("user_id", session.user.id);
+
+    if (error) {
+      console.error("Supabase delete failed:", error);
+      pushToast("Couldn't remove application.", "error");
+      return;
+    }
+
+    setApplications((current) =>
+      current.filter((app) => app.id !== id)
+    );
+
+    setSelectedId(null);
+
+    pushToast("Application removed.", "success");
+  },
+  [session, pushToast]
+);
+
 const selected =
   applications.find((a) => a.id === selectedId) || null;
 
-  /* ---- authentication gate ---- */
-  if (authLoading) {
-    return (
-      <div className="app">
-        <Style />
-        <div className="loading-screen">
-          <Loader2 className="spin" size={22} />
-          <span>Checking flight credentials…</span>
-        </div>
-      </div>
-    );
-  }
-
-  if (!session) {
-    return (
-      <div className="app">
-        <Style />
-        <AuthView pushToast={pushToast} />
-        <Toasts toasts={toasts} />
-      </div>
-    );
-  }
-
+/* ---- authentication gate ---- */
+if (authLoading) {
   return (
     <div className="app">
       <Style />
-      <TopBar view={view} setView={setView} />
+      <div className="loading-screen">
+        <Loader2 className="spin" size={22} />
+        <span>Checking flight credentials…</span>
+      </div>
+    </div>
+  );
+}
 
-      <main className="main">
-        {!loaded ? (
-          <div className="loading-screen">
-            <Loader2 className="spin" size={22} />
-            <span>Tuning instruments…</span>
-          </div>
-        ) : view === "dashboard" ? (
-          <Dashboard
-            applications={applications}
-            hasResume={!!resume.text}
-            onSelect={setSelectedId}
-            onGoAdd={() => setView("add")}
-          />
-        ) : view === "add" ? (
-          <AddFlight
-            resumeText={resume.text}
-            onAdd={addApplication}
-            onCancel={() => setView("dashboard")}
-            pushToast={pushToast}
-          />
-        ) : (
-          <ResumeView
-            resume={resume}
-            onSave={persistResume}
-            pushToast={pushToast}
-            onRecalculate={async () => {
-              if (!resume.text) {
-                pushToast("Add a resume first.", "error");
-                return;
-              }
-
-              pushToast("Recalculating matches…", "info");
-
-              const next = [];
-
-              for (const a of applications) {
-                try {
-                  const raw = await callGemini(
-                    MATCH_SYSTEM,
-                    matchUserPrompt(a, resume.text)
-                  );
-
-                  const parsed = safeParseJSON(raw);
-
-                  next.push(
-                    parsed
-                      ? {
-                          ...a,
-                          match: parsed.match,
-                          have: parsed.have,
-                          missing: parsed.missing,
-                          suggestions: parsed.suggestions,
-                        }
-                      : a
-                  );
-                } catch (e) {
-                  next.push(a);
-                }
-              }
-
-              persistApplications(next);
-              pushToast("Matches updated.", "success");
-            }}
-          />
-        )}
-      </main>
-
-      {selected && (
-        <FlightDrawer
-          app={selected}
-          resumeText={resume.text}
-          onClose={() => setSelectedId(null)}
-          onStatusChange={(s) =>
-            updateApplication(selected.id, { status: s })
-          }
-          onDelete={() => deleteApplication(selected.id)}
-          onQuestions={(q) =>
-            updateApplication(selected.id, { questions: q })
-          }
-          pushToast={pushToast}
-        />
-      )}
-
+if (!session) {
+  return (
+    <div className="app">
+      <Style />
+      <AuthView pushToast={pushToast} />
       <Toasts toasts={toasts} />
     </div>
   );
 }
+
+return (
+  <div className="app">
+    <Style />
+    <TopBar view={view} setView={setView} />
+
+    <main className="main">
+      {!loaded ? (
+        <div className="loading-screen">
+          <Loader2 className="spin" size={22} />
+          <span>Tuning instruments…</span>
+        </div>
+      ) : view === "dashboard" ? (
+        <Dashboard
+          applications={applications}
+          hasResume={!!resume.text}
+          onSelect={setSelectedId}
+          onGoAdd={() => setView("add")}
+        />
+      ) : view === "add" ? (
+        <AddFlight
+          resumeText={resume.text}
+          onAdd={addApplication}
+          onCancel={() => setView("dashboard")}
+          pushToast={pushToast}
+        />
+      ) : (
+        <ResumeView
+          resume={resume}
+          onSave={persistResume}
+          pushToast={pushToast}
+          onRecalculate={async () => {
+            if (!resume.text) {
+              pushToast("Add a resume first.", "error");
+              return;
+            }
+
+            pushToast("Recalculating matches…", "info");
+
+            const next = [];
+
+            for (const a of applications) {
+              try {
+                const raw = await callGemini(
+                  MATCH_SYSTEM,
+                  matchUserPrompt(a, resume.text)
+                );
+
+                const parsed = safeParseJSON(raw);
+
+                next.push(
+                  parsed
+                    ? {
+                        ...a,
+                        match: parsed.match,
+                        have: parsed.have,
+                        missing: parsed.missing,
+                        suggestions: parsed.suggestions,
+                      }
+                    : a
+                );
+              } catch (e) {
+                next.push(a);
+              }
+            }
+
+            for (const app of next) {
+              const { error } = await supabase
+                .from("Applications")
+                .update({
+                  match: app.match,
+                  have: app.have || [],
+                  missing: app.missing || [],
+                  suggestions: app.suggestions || [],
+                })
+                .eq("id", app.id)
+                .eq("user_id", session.user.id);
+
+              if (error) {
+                console.error(
+                  "Failed to save recalculated match for application:",
+                  app.id,
+                  error
+                );
+              }
+            }
+
+            setApplications(next);
+            pushToast("Matches updated.", "success");
+          }}
+        />
+      )}
+    </main>
+
+    {selected && (
+      <FlightDrawer
+        app={selected}
+        resumeText={resume.text}
+        onClose={() => setSelectedId(null)}
+        onStatusChange={(s) =>
+          updateApplication(selected.id, { status: s })
+        }
+        onDelete={() => deleteApplication(selected.id)}
+        onQuestions={(q) =>
+          updateApplication(selected.id, { questions: q })
+        }
+        pushToast={pushToast}
+      />
+    )}
+
+    <Toasts toasts={toasts} />
+  </div>
+);
+}
+
 
 function AuthView({ pushToast }) {
   const [mode, setMode] = useState("login");
