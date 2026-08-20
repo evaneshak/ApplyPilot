@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Plane, Radar, CheckCircle2, Plus, Sparkles,
   Loader2, Trash2, RefreshCw, FileText, MapPin,
-  DollarSign, CalendarClock, ArrowLeft, AlertCircle, Wand2
+  DollarSign, CalendarClock, ArrowLeft, AlertCircle, Wand2, Pencil
 } from "lucide-react";
 import { supabase } from "./supabase";
 
@@ -75,6 +75,60 @@ function daysLeft(deadline) {
   return diff;
 }
 
+
+function parseLocationValue(value) {
+  const raw = (value || "").trim();
+  const lower = raw.toLowerCase();
+
+  if (lower === "remote") {
+    return { mode: "remote", city: "" };
+  }
+
+  if (lower === "hybrid") {
+    return { mode: "hybrid", city: "" };
+  }
+
+  if (lower.startsWith("hybrid — ")) {
+    return { mode: "hybrid", city: raw.slice("Hybrid — ".length).trim() };
+  }
+
+  if (lower.startsWith("hybrid - ")) {
+    return { mode: "hybrid", city: raw.slice(raw.indexOf("-") + 1).trim() };
+  }
+
+  if (lower === "in person" || lower === "in-person" || lower === "on-site" || lower === "onsite") {
+    return { mode: "in-person", city: "" };
+  }
+
+  if (lower.startsWith("in person — ")) {
+    return { mode: "in-person", city: raw.slice("In person — ".length).trim() };
+  }
+
+  if (lower.startsWith("in-person — ")) {
+    return { mode: "in-person", city: raw.slice("In-person — ".length).trim() };
+  }
+
+  if (lower.startsWith("on-site — ")) {
+    return { mode: "in-person", city: raw.slice("On-site — ".length).trim() };
+  }
+
+  // Older saved applications that only contain a city are treated as in-person.
+  return { mode: "in-person", city: raw };
+}
+
+function formatLocationValue(mode, city) {
+  const cleanCity = (city || "").trim();
+
+  if (mode === "remote") return "Remote";
+  if (mode === "hybrid") return cleanCity ? `Hybrid — ${cleanCity}` : "Hybrid";
+  return cleanCity ? `In person — ${cleanCity}` : "In person";
+}
+
+function hasRequiredLocation(value) {
+  const parsed = parseLocationValue(value);
+  return parsed.mode === "remote" || !!parsed.city;
+}
+
 /* ---------------------------- gauge ---------------------------- */
 function MatchGauge({ value, size = 46 }) {
   if (value === null || value === undefined) {
@@ -138,6 +192,23 @@ export default function App() {
 
   const [session, setSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
+  const [recalculating, setRecalculating] = useState(false);
+  const [jobPostDraft, setJobPostDraft] = useState(() => {
+    try {
+      return localStorage.getItem("applypilot_job_post_draft") || "";
+    } catch (e) {
+      return "";
+    }
+  });
+
+  const [parsedJobDraft, setParsedJobDraft] = useState(() => {
+    try {
+      const saved = localStorage.getItem("applypilot_parsed_job_draft");
+      return saved ? JSON.parse(saved) : null;
+    } catch (e) {
+      return null;
+    }
+  });
 
   /* ---- Supabase authentication session ---- */
   useEffect(() => {
@@ -155,6 +226,58 @@ export default function App() {
     return () => {
       subscription.unsubscribe();
     };
+  }, []);
+
+  /* ---- keep an unfinished pasted job posting while navigating ---- */
+  const updateJobPostDraft = useCallback((nextText) => {
+    setJobPostDraft(nextText);
+
+    try {
+      if (nextText) {
+        localStorage.setItem("applypilot_job_post_draft", nextText);
+      } else {
+        localStorage.removeItem("applypilot_job_post_draft");
+      }
+    } catch (e) {
+      console.error("Couldn't persist unfinished job posting:", e);
+    }
+  }, []);
+
+  const clearJobPostDraft = useCallback(() => {
+    setJobPostDraft("");
+
+    try {
+      localStorage.removeItem("applypilot_job_post_draft");
+    } catch (e) {
+      console.error("Couldn't clear unfinished job posting:", e);
+    }
+  }, []);
+
+  const updateParsedJobDraft = useCallback((nextDraft) => {
+    setParsedJobDraft(nextDraft);
+
+    try {
+      if (nextDraft) {
+        localStorage.setItem(
+          "applypilot_parsed_job_draft",
+          JSON.stringify(nextDraft)
+        );
+      } else {
+        localStorage.removeItem("applypilot_parsed_job_draft");
+      }
+    } catch (e) {
+      console.error("Couldn't persist parsed job draft:", e);
+    }
+  }, []);
+
+  const clearParsedJobDraft = useCallback(() => {
+    setParsedJobDraft(null);
+
+    try {
+      localStorage.removeItem("applypilot_parsed_job_draft");
+    } catch (e) {
+      console.error("Couldn't clear parsed job draft:", e);
+    }
   }, []);
 
 
@@ -284,7 +407,7 @@ const addApplication = useCallback(
   async (app) => {
     if (!session?.user?.id) {
       pushToast("You must be logged in to save an application.", "error");
-      return;
+      return false;
     }
 
     const { data, error } = await supabase
@@ -311,10 +434,34 @@ const addApplication = useCallback(
     if (error) {
       console.error("Supabase insert failed:", error);
       pushToast("Couldn't save application.", "error");
-      return;
+      return false;
     }
 
     console.log("Supabase application created:", data);
+
+    const newApplication = {
+      id: data.id,
+      company: data.company,
+      position: data.position,
+      location: data.location,
+      salary: data.salary,
+      deadline: data.deadline,
+      status: data.status,
+      skills: data.skills || [],
+      rawText: data.raw_text,
+      match: data.match,
+      have: data.have || [],
+      missing: data.missing || [],
+      suggestions: data.suggestions || [],
+      questions: data.questions || [],
+      createdAt: data.created_at,
+    };
+
+    // Show the new application immediately without requiring a refresh.
+    setApplications((current) => [
+      newApplication,
+      ...current,
+    ]);
 
     pushToast(
       "Flight logged: " + app.company + " — " + app.position,
@@ -322,6 +469,7 @@ const addApplication = useCallback(
     );
 
     setView("dashboard");
+    return true;
   },
   [session, pushToast]
 );
@@ -330,7 +478,7 @@ const updateApplication = useCallback(
   async (id, patch) => {
     if (!session?.user?.id) {
       pushToast("You must be logged in to update an application.", "error");
-      return;
+      return false;
     }
 
     // Update the ApplyPilot UI immediately
@@ -370,10 +518,11 @@ const updateApplication = useCallback(
     if (error) {
       console.error("Supabase update failed:", error);
       pushToast("Couldn't update application.", "error");
-      return;
+      return false;
     }
 
     console.log("Supabase application updated:", id, patch);
+    return true;
   },
   [session, pushToast]
 );
@@ -458,70 +607,87 @@ return (
           onAdd={addApplication}
           onCancel={() => setView("dashboard")}
           pushToast={pushToast}
+          initialText={jobPostDraft}
+          onTextChange={updateJobPostDraft}
+          onClearText={clearJobPostDraft}
+          initialDraft={parsedJobDraft}
+          onDraftChange={updateParsedJobDraft}
+          onClearDraft={clearParsedJobDraft}
         />
       ) : (
         <ResumeView
           resume={resume}
           onSave={persistResume}
           pushToast={pushToast}
+          recalculating={recalculating}
           onRecalculate={async () => {
             if (!resume.text) {
               pushToast("Add a resume first.", "error");
               return;
             }
 
+            if (applications.length === 0) {
+              pushToast("Log an application before recalculating matches.", "info");
+              return;
+            }
+
+            setRecalculating(true);
             pushToast("Recalculating matches…", "info");
 
-            const next = [];
+            try {
+              const next = [];
 
-            for (const a of applications) {
-              try {
-                const raw = await callGemini(
-                  MATCH_SYSTEM,
-                  matchUserPrompt(a, resume.text)
-                );
+              for (const a of applications) {
+                try {
+                  const raw = await callGemini(
+                    MATCH_SYSTEM,
+                    matchUserPrompt(a, resume.text)
+                  );
 
-                const parsed = safeParseJSON(raw);
+                  const parsed = safeParseJSON(raw);
 
-                next.push(
-                  parsed
-                    ? {
-                        ...a,
-                        match: parsed.match,
-                        have: parsed.have,
-                        missing: parsed.missing,
-                        suggestions: parsed.suggestions,
-                      }
-                    : a
-                );
-              } catch (e) {
-                next.push(a);
+                  next.push(
+                    parsed
+                      ? {
+                          ...a,
+                          match: parsed.match,
+                          have: parsed.have,
+                          missing: parsed.missing,
+                          suggestions: parsed.suggestions,
+                        }
+                      : a
+                  );
+                } catch (e) {
+                  next.push(a);
+                }
               }
-            }
 
-            for (const app of next) {
-              const { error } = await supabase
-                .from("Applications")
-                .update({
-                  match: app.match,
-                  have: app.have || [],
-                  missing: app.missing || [],
-                  suggestions: app.suggestions || [],
-                })
-                .eq("id", app.id)
-                .eq("user_id", session.user.id);
+              for (const app of next) {
+                const { error } = await supabase
+                  .from("Applications")
+                  .update({
+                    match: app.match,
+                    have: app.have || [],
+                    missing: app.missing || [],
+                    suggestions: app.suggestions || [],
+                  })
+                  .eq("id", app.id)
+                  .eq("user_id", session.user.id);
 
-              if (error) {
-                console.error(
-                  "Failed to save recalculated match for application:",
-                  app.id,
-                  error
-                );
+                if (error) {
+                  console.error(
+                    "Failed to save recalculated match for application:",
+                    app.id,
+                    error
+                  );
+                }
               }
-            }
 
-            setApplications(next);
-            pushToast("Matches updated.", "success");
+              setApplications(next);
+              pushToast("Matches updated.", "success");
+            } finally {
+              setRecalculating(false);
+            }
           }}
         />
       )}
@@ -536,6 +702,9 @@ return (
           updateApplication(selected.id, { status: s })
         }
         onDelete={() => deleteApplication(selected.id)}
+        onEdit={(patch) =>
+          updateApplication(selected.id, patch)
+        }
         onQuestions={(q) =>
           updateApplication(selected.id, { questions: q })
         }
@@ -797,7 +966,7 @@ function FlightStrip({ app, onSelect }) {
 
 /* -------------------------- add flight --------------------------- */
 const EXTRACT_SYSTEM =
-  "You extract structured data from a job posting. Respond with ONLY a raw JSON object, no markdown fences, no commentary, no explanation. Schema: {\"company\": string|null, \"position\": string|null, \"location\": string|null, \"salary\": string|null, \"deadline\": string|null, \"skills\": string[]}. Use null for any field you cannot find. Limit skills to at most 8 short items (e.g. \"Python\", \"AWS\").";
+  "You extract structured data from a job posting. Respond with ONLY a raw JSON object, no markdown fences, no commentary, no explanation. Schema: {\"company\": string|null, \"position\": string|null, \"location\": string|null, \"salary\": string|null, \"deadline\": string|null, \"skills\": string[]}. For location/work arrangement: return exactly \"Remote\" for fully remote roles. For hybrid roles, return \"Hybrid — CITY/REGION\" when a city or region is provided, otherwise return \"Hybrid\". For on-site/in-person roles, return \"In person — CITY/REGION\" when a city or region is provided, otherwise return \"In person\". Use null only when neither work arrangement nor location can be determined. Limit skills to at most 8 short items (e.g. \"Python\", \"AWS\").";
 
 const MATCH_SYSTEM =
   "You compare a candidate's resume against a job posting. Respond with ONLY a raw JSON object, no markdown fences, no commentary. Schema: {\"match\": number (0-100 integer), \"have\": string[] (skills/experience the resume already shows that the job wants), \"missing\": string[] (skills the job wants that the resume does not show), \"suggestions\": string[] (at most 2 short, concrete resume-wording tips, each under 25 words, written in your own words, no quotations)}.";
@@ -809,35 +978,128 @@ function matchUserPrompt(app, resumeText) {
     "\n\nRESUME:\n" + resumeText;
 }
 
-function AddFlight({ resumeText, onAdd, onCancel, pushToast }) {
-  const [text, setText] = useState("");
+function AddFlight({
+  resumeText,
+  onAdd,
+  onCancel,
+  pushToast,
+  initialText,
+  onTextChange,
+  onClearText,
+  initialDraft,
+  onDraftChange,
+  onClearDraft,
+}) {
+  const [text, setText] = useState(initialText || "");
   const [parsing, setParsing] = useState(false);
   const [matching, setMatching] = useState(false);
-  const [draft, setDraft] = useState(null);
+  const [logging, setLogging] = useState(false);
+  const [draft, setDraft] = useState(initialDraft || null);
+
+  useEffect(() => {
+    setText(initialText || "");
+  }, [initialText]);
+
+  useEffect(() => {
+    setDraft(initialDraft || null);
+  }, [initialDraft]);
+
+  const handleTextChange = (nextText) => {
+    setText(nextText);
+    onTextChange(nextText);
+  };
 
   const handleParse = async () => {
-    if (!text.trim()) { pushToast("Paste a job posting first.", "error"); return; }
+    if (!text.trim()) {
+      pushToast("Paste a job posting first.", "error");
+      return;
+    }
+
     setParsing(true);
+    setMatching(false);
     setDraft(null);
+    onClearDraft();
+
     try {
       const raw = await callGemini(EXTRACT_SYSTEM, text);
       const parsed = safeParseJSON(raw);
-      if (!parsed) throw new Error("parse-failed");
-      let match = null, have = [], missing = [], suggestions = [];
+
+      if (!parsed) {
+        throw new Error("parse-failed");
+      }
+
+      let match = null;
+      let have = [];
+      let missing = [];
+      let suggestions = [];
+
       if (resumeText) {
         setMatching(true);
+
         try {
-          const mraw = await callGemini(MATCH_SYSTEM, matchUserPrompt({ ...parsed, rawText: text }, resumeText));
+          const mraw = await callGemini(
+            MATCH_SYSTEM,
+            matchUserPrompt({ ...parsed, rawText: text }, resumeText)
+          );
+
           const mp = safeParseJSON(mraw);
-          if (mp) { match = mp.match; have = mp.have || []; missing = mp.missing || []; suggestions = mp.suggestions || []; }
-        } catch (e) { /* skip match on failure */ }
-        setMatching(false);
+
+          if (mp) {
+            match = mp.match;
+            have = mp.have || [];
+            missing = mp.missing || [];
+            suggestions = mp.suggestions || [];
+          }
+        } catch (e) {
+          console.error("Resume match failed during parsing:", e);
+        } finally {
+          setMatching(false);
+        }
       }
-      setDraft({ ...parsed, rawText: text, match, have, missing, suggestions });
+
+      const nextDraft = {
+        ...parsed,
+        rawText: text,
+        match,
+        have,
+        missing,
+        suggestions,
+      };
+
+      setDraft(nextDraft);
+      onDraftChange(nextDraft);
     } catch (e) {
       pushToast("Couldn't read that posting. Try pasting it again.", "error");
     } finally {
       setParsing(false);
+      setMatching(false);
+    }
+  };
+
+  const handleLogFlight = async () => {
+    if (!draft || logging) return;
+
+    if (!hasRequiredLocation(draft.location)) {
+      pushToast(
+        "Choose a city/location for Hybrid or In person roles.",
+        "error"
+      );
+      return;
+    }
+
+    setLogging(true);
+
+    try {
+      const success = await onAdd(draft);
+
+      if (success !== false) {
+        setDraft(null);
+        setText("");
+        onClearText();
+        onClearDraft();
+      }
+    } finally {
+      setLogging(false);
     }
   };
 
@@ -851,33 +1113,90 @@ function AddFlight({ resumeText, onAdd, onCancel, pushToast }) {
         rows={9}
         placeholder="Paste the full job description here…"
         value={text}
-        onChange={(e) => setText(e.target.value)}
-        disabled={parsing}
+        onChange={(e) => handleTextChange(e.target.value)}
+        disabled={parsing || logging}
       />
 
+      {(parsing || matching) && (
+        <div className="operation-status fade-in">
+          <Loader2 className="spin" size={15} />
+          <span>
+            {matching
+              ? "Posting read. Matching it to your resume…"
+              : "Reading the job posting…"}
+          </span>
+        </div>
+      )}
+
       <div className="row-actions">
-        <button className="btn btn-primary" onClick={handleParse} disabled={parsing}>
+        <button
+          className="btn btn-primary"
+          onClick={handleParse}
+          disabled={parsing || logging}
+        >
           {parsing ? <Loader2 className="spin" size={16} /> : <Sparkles size={16} />}
-          {parsing ? (matching ? "Matching to your resume…" : "Reading posting…") : "Parse posting"}
+          {parsing
+            ? (matching ? "Matching to your resume…" : "Reading posting…")
+            : "Parse posting"}
         </button>
-        <button className="btn btn-ghost" onClick={onCancel}>Cancel</button>
+
+        <button
+          className="btn btn-ghost"
+          onClick={onCancel}
+          disabled={logging}
+        >
+          Cancel
+        </button>
       </div>
 
       {draft && (
         <div className="draft fade-in">
           <div className="draft-grid">
-            <Field label="Company" value={draft.company} onChange={(v) => setDraft({ ...draft, company: v })} />
-            <Field label="Position" value={draft.position} onChange={(v) => setDraft({ ...draft, position: v })} />
+            <Field
+              label="Company"
+              value={draft.company}
+              onChange={(v) => {
+                const nextDraft = { ...draft, company: v };
+                setDraft(nextDraft);
+                onDraftChange(nextDraft);
+              }}
+            />
+            <Field
+              label="Position"
+              value={draft.position}
+              onChange={(v) => {
+                const nextDraft = { ...draft, position: v };
+                setDraft(nextDraft);
+                onDraftChange(nextDraft);
+              }}
+            />
             <LocationField
               value={draft.location}
-              onChange={(v) => setDraft({ ...draft, location: v })}
+              onChange={(v) => {
+                const nextDraft = { ...draft, location: v };
+                setDraft(nextDraft);
+                onDraftChange(nextDraft);
+              }}
             />
-            <Field label="Salary" value={draft.salary} onChange={(v) => setDraft({ ...draft, salary: v })} icon={<DollarSign size={12} />} />
+            <Field
+              label="Salary"
+              value={draft.salary}
+              onChange={(v) => {
+                const nextDraft = { ...draft, salary: v };
+                setDraft(nextDraft);
+                onDraftChange(nextDraft);
+              }}
+              icon={<DollarSign size={12} />}
+            />
             <Field
               label="Deadline"
               type="date"
               value={draft.deadline}
-              onChange={(v) => setDraft({ ...draft, deadline: v })}
+              onChange={(v) => {
+                const nextDraft = { ...draft, deadline: v };
+                setDraft(nextDraft);
+                onDraftChange(nextDraft);
+              }}
               icon={<CalendarClock size={12} />}
             />
           </div>
@@ -885,8 +1204,12 @@ function AddFlight({ resumeText, onAdd, onCancel, pushToast }) {
           <div className="skills-block">
             <span className="mini-label">Skills wanted</span>
             <div className="chip-row">
-              {(draft.skills || []).length === 0 && <span className="muted-text">None detected</span>}
-              {(draft.skills || []).map((s, i) => <span className="chip" key={i}>{s}</span>)}
+              {(draft.skills || []).length === 0 && (
+                <span className="muted-text">None detected</span>
+              )}
+              {(draft.skills || []).map((s, i) => (
+                <span className="chip" key={i}>{s}</span>
+              ))}
             </div>
           </div>
 
@@ -896,25 +1219,57 @@ function AddFlight({ resumeText, onAdd, onCancel, pushToast }) {
               <div className="match-details">
                 {draft.have && draft.have.length > 0 && (
                   <div className="chip-row">
-                    {draft.have.map((s, i) => <span className="chip chip-have" key={i}>{s}</span>)}
+                    {draft.have.map((s, i) => (
+                      <span className="chip chip-have" key={i}>{s}</span>
+                    ))}
                   </div>
                 )}
                 {draft.missing && draft.missing.length > 0 && (
                   <div className="chip-row">
-                    {draft.missing.map((s, i) => <span className="chip chip-missing" key={i}>{s}</span>)}
+                    {draft.missing.map((s, i) => (
+                      <span className="chip chip-missing" key={i}>{s}</span>
+                    ))}
                   </div>
                 )}
               </div>
             </div>
           ) : (
-            <div className="hint"><AlertCircle size={13} /> Add a resume to see a match score for this role.</div>
+            <div className="hint">
+              <AlertCircle size={13} /> Add a resume to see a match score for this role.
+            </div>
+          )}
+
+          {logging && (
+            <div className="operation-status fade-in">
+              <Loader2 className="spin" size={15} />
+              <span>Saving this application to your dashboard…</span>
+            </div>
           )}
 
           <div className="row-actions">
-            <button className="btn btn-primary" onClick={() => onAdd(draft)}>
-              <Plus size={16} /> Log flight
+            <button
+              className="btn btn-primary"
+              onClick={handleLogFlight}
+              disabled={logging}
+            >
+              {logging ? (
+                <Loader2 className="spin" size={16} />
+              ) : (
+                <Plus size={16} />
+              )}
+              {logging ? "Logging flight…" : "Log flight"}
             </button>
-            <button className="btn btn-ghost" onClick={() => setDraft(null)}>Discard</button>
+
+            <button
+              className="btn btn-ghost"
+              onClick={() => {
+                setDraft(null);
+                onClearDraft();
+              }}
+              disabled={logging}
+            >
+              Discard parsed result
+            </button>
           </div>
         </div>
       )}
@@ -937,15 +1292,37 @@ function Field({ label, value, onChange, icon, type = "text" }) {
   );
 }
 
+/* ------------------------------------------------------------------
+   FIXED: LocationField previously kept its own local copies of
+   `workMode` and `cityText` in useState, seeded only once on mount
+   from the incoming `value` prop. Because the parent components
+   rebuild and re-pass the draft object on every change (and route it
+   through localStorage / effects), this component could get treated
+   as re-mounted and reset back to the *original* seeded mode
+   (e.g. "Remote"), wiping out an in-progress Hybrid/In person +
+   city selection right when a suggestion was clicked.
+
+   Fix: don't fork local state for workMode/cityText at all. Derive
+   them directly from `value` on every render so the component is
+   fully controlled by its parent and can't drift out of sync.
+------------------------------------------------------------------*/
 function LocationField({ value, onChange }) {
+  const { mode: workMode, city: cityText } = parseLocationValue(value);
   const [suggestions, setSuggestions] = useState([]);
   const [loadingLocations, setLoadingLocations] = useState(false);
 
   useEffect(() => {
-    const query = (value || "").trim();
+    const query = cityText.trim();
+
+    if (workMode === "remote") {
+      setSuggestions([]);
+      setLoadingLocations(false);
+      return;
+    }
 
     if (query.length < 2) {
       setSuggestions([]);
+      setLoadingLocations(false);
       return;
     }
 
@@ -1004,7 +1381,32 @@ function LocationField({ value, onChange }) {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [value]);
+  }, [cityText, workMode]);
+
+  const selectMode = (mode) => {
+    setSuggestions([]);
+    setLoadingLocations(false);
+
+    if (mode === "remote") {
+      onChange("Remote");
+      return;
+    }
+
+    // Hybrid and In person require a city/location.
+    // Start with a clean field so stale Remote state cannot take over.
+    onChange(formatLocationValue(mode, ""));
+  };
+
+  const changeCity = (nextCity) => {
+    onChange(formatLocationValue(workMode, nextCity));
+  };
+
+  const selectCity = (city) => {
+    const modeToKeep = workMode === "hybrid" ? "hybrid" : "in-person";
+
+    setSuggestions([]);
+    onChange(formatLocationValue(modeToKeep, city));
+  };
 
   return (
     <label className="field location-field">
@@ -1012,46 +1414,85 @@ function LocationField({ value, onChange }) {
         <MapPin size={12} /> Location
       </span>
 
-      <div className="location-input-wrap">
-        <input
-          className="input"
-          type="text"
-          value={value || ""}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder="Start typing a city..."
-          autoComplete="off"
-        />
+      <div className="location-quick-row">
+        <button
+          type="button"
+          className={"location-quick" + (workMode === "remote" ? " active" : "")}
+          onClick={() => selectMode("remote")}
+        >
+          Remote
+        </button>
 
-        {loadingLocations && (
-          <Loader2 className="spin location-loader" size={15} />
-        )}
+        <button
+          type="button"
+          className={"location-quick" + (workMode === "hybrid" ? " active" : "")}
+          onClick={() => selectMode("hybrid")}
+        >
+          Hybrid
+        </button>
 
-        {suggestions.length > 0 && (
-          <div className="location-dropdown">
-            {suggestions.map((place) => (
-              <button
-                key={place.id}
-                type="button"
-                className="location-option"
-                onClick={() => {
-                  onChange(place.label);
-                  setSuggestions([]);
-                }}
-              >
-                <MapPin size={13} />
-                {place.label}
-              </button>
-            ))}
-          </div>
-        )}
+        <button
+          type="button"
+          className={"location-quick" + (workMode === "in-person" ? " active" : "")}
+          onClick={() => selectMode("in-person")}
+        >
+          In person
+        </button>
       </div>
+
+      {workMode === "remote" ? (
+        <div className="location-remote-note">
+          No location required for remote roles.
+        </div>
+      ) : (
+        <div className="location-input-wrap">
+          <input
+            className="input"
+            type="text"
+            value={cityText}
+            onChange={(e) => changeCity(e.target.value)}
+            placeholder={
+              workMode === "hybrid"
+                ? "Enter the hybrid job location..."
+                : "Enter the in-person job location..."
+            }
+            autoComplete="off"
+          />
+
+          {loadingLocations && (
+            <Loader2 className="spin location-loader" size={15} />
+          )}
+
+          {suggestions.length > 0 && (
+            <div className="location-dropdown">
+              {suggestions.map((place) => (
+                <button
+                  key={place.id}
+                  type="button"
+                  className="location-option"
+                  onClick={() => selectCity(place.label)}
+                >
+                  <MapPin size={13} />
+                  {place.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </label>
   );
 }
 
 
 /* --------------------------- resume view -------------------------- */
-function ResumeView({ resume, onSave, pushToast, onRecalculate }) {
+function ResumeView({
+  resume,
+  onSave,
+  pushToast,
+  onRecalculate,
+  recalculating,
+}) {
   const [text, setText] = useState(resume.text || "");
   const [saving, setSaving] = useState(false);
 
@@ -1060,51 +1501,195 @@ function ResumeView({ resume, onSave, pushToast, onRecalculate }) {
   const save = async () => {
     setSaving(true);
 
-    const success = await onSave({
-      text,
-      updatedAt: Date.now(),
-    });
+    try {
+      const success = await onSave({
+        text,
+        updatedAt: Date.now(),
+      });
 
-    setSaving(false);
-
-    if (success !== false) {
-      pushToast("Resume saved.", "success");
+      if (success !== false) {
+        pushToast("Resume saved.", "success");
+      }
+    } finally {
+      setSaving(false);
     }
   };
+
+  const busy = saving || recalculating;
 
   return (
     <div className="panel">
       <h2 className="panel-title"><FileText size={17} /> Your resume</h2>
       <p className="panel-sub">Paste your resume as plain text. ApplyPilot compares it against every posting you log so you always see where you stand.</p>
+
       <textarea
         className="textarea"
         rows={14}
         placeholder="Paste your resume text here…"
         value={text}
         onChange={(e) => setText(e.target.value)}
+        disabled={busy}
       />
+
+      {saving && (
+        <div className="operation-status fade-in">
+          <Loader2 className="spin" size={15} />
+          <span>Saving your resume…</span>
+        </div>
+      )}
+
+      {recalculating && (
+        <div className="operation-status fade-in">
+          <Loader2 className="spin" size={15} />
+          <span>Comparing your resume against all logged applications…</span>
+        </div>
+      )}
+
       <div className="row-actions">
-        <button className="btn btn-primary" onClick={save} disabled={saving || !text.trim()}>
-          {saving ? <Loader2 className="spin" size={16} /> : <CheckCircle2 size={16} />} Save resume
+        <button
+          className="btn btn-primary"
+          onClick={save}
+          disabled={busy || !text.trim()}
+        >
+          {saving ? (
+            <Loader2 className="spin" size={16} />
+          ) : (
+            <CheckCircle2 size={16} />
+          )}
+          {saving ? "Saving resume…" : "Save resume"}
         </button>
-        <button className="btn btn-ghost" onClick={onRecalculate}>
-          <RefreshCw size={15} /> Recalculate all matches
+
+        <button
+          className="btn btn-ghost"
+          onClick={onRecalculate}
+          disabled={busy}
+        >
+          {recalculating ? (
+            <Loader2 className="spin" size={15} />
+          ) : (
+            <RefreshCw size={15} />
+          )}
+          {recalculating ? "Recalculating matches…" : "Recalculate all matches"}
         </button>
       </div>
+
       {resume.updatedAt && (
-        <p className="muted-text small">Last saved {new Date(resume.updatedAt).toLocaleString()}</p>
+        <p className="muted-text small">
+          Last saved {new Date(resume.updatedAt).toLocaleString()}
+        </p>
       )}
     </div>
   );
 }
 
+
 /* -------------------------- flight drawer -------------------------- */
 const INTERVIEW_SYSTEM =
   "You generate likely interview questions for a job candidate. Respond with ONLY a raw JSON object, no markdown fences, no commentary. Schema: {\"questions\": string[]} containing exactly 6 concise, realistic interview questions tailored to the role and, if given, the candidate's background.";
 
-function FlightDrawer({ app, resumeText, onClose, onStatusChange, onDelete, onQuestions, pushToast }) {
+function FlightDrawer({
+  app,
+  resumeText,
+  onClose,
+  onStatusChange,
+  onDelete,
+  onEdit,
+  onQuestions,
+  pushToast,
+}) {
   const [genLoading, setGenLoading] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [editSaving, setEditSaving] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
+  const [editDraft, setEditDraft] = useState({
+    company: app.company || "",
+    position: app.position || "",
+    location: app.location || "",
+    salary: app.salary || "",
+    deadline: app.deadline || "",
+    rawText: app.rawText || "",
+  });
+
   const dl = daysLeft(app.deadline);
+
+  useEffect(() => {
+    if (editing) return;
+
+    setEditDraft({
+      company: app.company || "",
+      position: app.position || "",
+      location: app.location || "",
+      salary: app.salary || "",
+      deadline: app.deadline || "",
+      rawText: app.rawText || "",
+    });
+  }, [
+    app.company,
+    app.position,
+    app.location,
+    app.salary,
+    app.deadline,
+    app.rawText,
+    editing,
+  ]);
+
+  const startEditing = () => {
+    setEditDraft({
+      company: app.company || "",
+      position: app.position || "",
+      location: app.location || "",
+      salary: app.salary || "",
+      deadline: app.deadline || "",
+      rawText: app.rawText || "",
+    });
+    setEditing(true);
+  };
+
+  const cancelEditing = () => {
+    setEditDraft({
+      company: app.company || "",
+      position: app.position || "",
+      location: app.location || "",
+      salary: app.salary || "",
+      deadline: app.deadline || "",
+      rawText: app.rawText || "",
+    });
+    setEditing(false);
+  };
+
+  const saveEdits = async () => {
+    if (!editDraft.company.trim() || !editDraft.position.trim()) {
+      pushToast("Company and position are required.", "error");
+      return;
+    }
+
+    if (!hasRequiredLocation(editDraft.location)) {
+      pushToast(
+        "Choose a city/location for Hybrid or In person roles.",
+        "error"
+      );
+      return;
+    }
+
+    setEditSaving(true);
+
+    const success = await onEdit({
+      company: editDraft.company.trim(),
+      position: editDraft.position.trim(),
+      location: editDraft.location.trim(),
+      salary: editDraft.salary.trim(),
+      deadline: editDraft.deadline || null,
+      rawText: editDraft.rawText,
+    });
+
+    setEditSaving(false);
+
+    if (success !== false) {
+      setEditing(false);
+      pushToast("Application updated.", "success");
+    }
+  };
 
   const generateQuestions = async () => {
     setGenLoading(true);
@@ -1129,94 +1714,216 @@ function FlightDrawer({ app, resumeText, onClose, onStatusChange, onDelete, onQu
       <div className="drawer" onClick={(e) => e.stopPropagation()}>
         <div className="drawer-head">
           <button className="icon-btn" onClick={onClose}><ArrowLeft size={17} /></button>
-          <MatchGauge value={app.match} size={40} />
+          <div className="drawer-head-actions">
+            {!editing && (
+              <button className="btn btn-ghost btn-compact" onClick={startEditing}>
+                <Pencil size={14} /> Edit
+              </button>
+            )}
+            <MatchGauge value={app.match} size={40} />
+          </div>
         </div>
 
-        <h2 className="drawer-title">{app.position || "Untitled role"}</h2>
-        <p className="drawer-company">{app.company || "Unknown company"}</p>
-
-        <div className="drawer-meta">
-          {app.location && <span><MapPin size={13} /> {app.location}</span>}
-          {app.salary && <span><DollarSign size={13} /> {app.salary}</span>}
-          {app.deadline && (
-            <span className={dl !== null && dl <= 5 && dl >= 0 ? "urgent" : ""}>
-              <CalendarClock size={13} /> {app.deadline}{dl !== null && dl >= 0 ? " · " + dl + " days left" : ""}
-            </span>
-          )}
-        </div>
-
-        <div className="stage-track">
-          {STATUS_ORDER.filter((s) => s !== "rejected").map((s) => (
-            <button
-              key={s}
-              className={"stage-pill" + (app.status === s ? " active" : "")}
-              style={app.status === s ? { borderColor: STATUS_META[s].color, color: STATUS_META[s].color } : {}}
-              onClick={() => onStatusChange(s)}
-            >
-              {STATUS_META[s].label}
-            </button>
-          ))}
-          <button
-            className={"stage-pill stage-pill-reject" + (app.status === "rejected" ? " active" : "")}
-            onClick={() => onStatusChange("rejected")}
-          >
-            Rejected
-          </button>
-        </div>
-
-        {(app.skills && app.skills.length > 0) && (
-          <Section title="Skills wanted">
-            <div className="chip-row">
-              {app.skills.map((s, i) => <span className="chip" key={i}>{s}</span>)}
+        {editing ? (
+          <div className="edit-application fade-in">
+            <div className="edit-grid">
+              <Field
+                label="Company"
+                value={editDraft.company}
+                onChange={(v) => setEditDraft({ ...editDraft, company: v })}
+              />
+              <Field
+                label="Position"
+                value={editDraft.position}
+                onChange={(v) => setEditDraft({ ...editDraft, position: v })}
+              />
+              <LocationField
+                value={editDraft.location}
+                onChange={(v) => setEditDraft({ ...editDraft, location: v })}
+              />
+              <Field
+                label="Salary"
+                value={editDraft.salary}
+                onChange={(v) => setEditDraft({ ...editDraft, salary: v })}
+                icon={<DollarSign size={12} />}
+              />
+              <Field
+                label="Deadline"
+                type="date"
+                value={editDraft.deadline}
+                onChange={(v) => setEditDraft({ ...editDraft, deadline: v })}
+                icon={<CalendarClock size={12} />}
+              />
             </div>
-          </Section>
-        )}
 
-        {resumeText ? (
+            <label className="field edit-description-field">
+              <span className="mini-label"><FileText size={12} /> Job description</span>
+              <textarea
+                className="textarea"
+                rows={8}
+                value={editDraft.rawText}
+                onChange={(e) =>
+                  setEditDraft({ ...editDraft, rawText: e.target.value })
+                }
+                placeholder="Job description"
+              />
+            </label>
+
+            <div className="row-actions">
+              <button
+                className="btn btn-primary"
+                onClick={saveEdits}
+                disabled={editSaving}
+              >
+                {editSaving ? <Loader2 className="spin" size={15} /> : <CheckCircle2 size={15} />}
+                {editSaving ? "Saving…" : "Save changes"}
+              </button>
+              <button
+                className="btn btn-ghost"
+                onClick={cancelEditing}
+                disabled={editSaving}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        ) : (
           <>
-            {(app.have && app.have.length > 0) && (
-              <Section title="You already have">
+            <h2 className="drawer-title">{app.position || "Untitled role"}</h2>
+            <p className="drawer-company">{app.company || "Unknown company"}</p>
+
+            <div className="drawer-meta">
+              {app.location && <span><MapPin size={13} /> {app.location}</span>}
+              {app.salary && <span><DollarSign size={13} /> {app.salary}</span>}
+              {app.deadline && (
+                <span className={dl !== null && dl <= 5 && dl >= 0 ? "urgent" : ""}>
+                  <CalendarClock size={13} /> {app.deadline}{dl !== null && dl >= 0 ? " · " + dl + " days left" : ""}
+                </span>
+              )}
+            </div>
+
+            <div className="stage-track">
+              {STATUS_ORDER.filter((s) => s !== "rejected").map((s) => (
+                <button
+                  key={s}
+                  className={"stage-pill" + (app.status === s ? " active" : "")}
+                  style={app.status === s ? { borderColor: STATUS_META[s].color, color: STATUS_META[s].color } : {}}
+                  onClick={() => onStatusChange(s)}
+                >
+                  {STATUS_META[s].label}
+                </button>
+              ))}
+              <button
+                className={"stage-pill stage-pill-reject" + (app.status === "rejected" ? " active" : "")}
+                onClick={() => onStatusChange("rejected")}
+              >
+                Rejected
+              </button>
+            </div>
+
+            {(app.skills && app.skills.length > 0) && (
+              <Section title="Skills wanted">
                 <div className="chip-row">
-                  {app.have.map((s, i) => <span className="chip chip-have" key={i}>{s}</span>)}
+                  {app.skills.map((s, i) => <span className="chip" key={i}>{s}</span>)}
                 </div>
               </Section>
             )}
-            {(app.missing && app.missing.length > 0) && (
-              <Section title="Worth adding">
-                <div className="chip-row">
-                  {app.missing.map((s, i) => <span className="chip chip-missing" key={i}>{s}</span>)}
-                </div>
+
+            {resumeText ? (
+              <>
+                {(app.have && app.have.length > 0) && (
+                  <Section title="You already have">
+                    <div className="chip-row">
+                      {app.have.map((s, i) => <span className="chip chip-have" key={i}>{s}</span>)}
+                    </div>
+                  </Section>
+                )}
+                {(app.missing && app.missing.length > 0) && (
+                  <Section title="Worth adding">
+                    <div className="chip-row">
+                      {app.missing.map((s, i) => <span className="chip chip-missing" key={i}>{s}</span>)}
+                    </div>
+                  </Section>
+                )}
+                {(app.suggestions && app.suggestions.length > 0) && (
+                  <Section title="Resume tips">
+                    <ul className="tip-list">
+                      {app.suggestions.map((s, i) => <li key={i}>{s}</li>)}
+                    </ul>
+                  </Section>
+                )}
+              </>
+            ) : (
+              <div className="hint"><AlertCircle size={13} /> Add a resume to unlock matching and interview prep.</div>
+            )}
+
+            {app.rawText && (
+              <Section title="Job description">
+                <p className="job-description">{app.rawText}</p>
               </Section>
             )}
-            {(app.suggestions && app.suggestions.length > 0) && (
-              <Section title="Resume tips">
-                <ul className="tip-list">
-                  {app.suggestions.map((s, i) => <li key={i}>{s}</li>)}
-                </ul>
-              </Section>
+
+            <Section title="Interview prep">
+              {app.questions && app.questions.length > 0 ? (
+                <ol className="question-list">
+                  {app.questions.map((q, i) => <li key={i}>{q}</li>)}
+                </ol>
+              ) : (
+                <p className="muted-text">No questions generated yet.</p>
+              )}
+              <button className="btn btn-ghost" onClick={generateQuestions} disabled={genLoading}>
+                {genLoading ? <Loader2 className="spin" size={15} /> : <Wand2 size={15} />}
+                {app.questions && app.questions.length > 0 ? "Regenerate questions" : "Generate questions"}
+              </button>
+            </Section>
+
+            {!confirmDelete ? (
+              <button
+                className="btn btn-danger"
+                onClick={() => setConfirmDelete(true)}
+              >
+                <Trash2 size={15} /> Remove this flight
+              </button>
+            ) : (
+              <div className="delete-confirm fade-in">
+                <div className="delete-confirm-copy">
+                  <AlertCircle size={16} />
+                  <div>
+                    <strong>Delete this application?</strong>
+                    <p>This will permanently remove it from ApplyPilot.</p>
+                  </div>
+                </div>
+
+                <div className="row-actions delete-confirm-actions">
+                  <button
+                    className="btn btn-danger-solid"
+                    disabled={deleteLoading}
+                    onClick={async () => {
+                      setDeleteLoading(true);
+                      await onDelete();
+                      setDeleteLoading(false);
+                    }}
+                  >
+                    {deleteLoading ? (
+                      <Loader2 className="spin" size={15} />
+                    ) : (
+                      <Trash2 size={15} />
+                    )}
+                    {deleteLoading ? "Deleting…" : "Delete application"}
+                  </button>
+
+                  <button
+                    className="btn btn-ghost"
+                    disabled={deleteLoading}
+                    onClick={() => setConfirmDelete(false)}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
             )}
           </>
-        ) : (
-          <div className="hint"><AlertCircle size={13} /> Add a resume to unlock matching and interview prep.</div>
         )}
-
-        <Section title="Interview prep">
-          {app.questions && app.questions.length > 0 ? (
-            <ol className="question-list">
-              {app.questions.map((q, i) => <li key={i}>{q}</li>)}
-            </ol>
-          ) : (
-            <p className="muted-text">No questions generated yet.</p>
-          )}
-          <button className="btn btn-ghost" onClick={generateQuestions} disabled={genLoading}>
-            {genLoading ? <Loader2 className="spin" size={15} /> : <Wand2 size={15} />}
-            {app.questions && app.questions.length > 0 ? "Regenerate questions" : "Generate questions"}
-          </button>
-        </Section>
-
-        <button className="btn btn-danger" onClick={onDelete}>
-          <Trash2 size={15} /> Remove this flight
-        </button>
       </div>
     </div>
   );
@@ -1455,6 +2162,21 @@ function Style() {
 
       .row-actions{display:flex; gap:10px; margin-top:14px; flex-wrap:wrap;}
 
+      .operation-status{
+        display:flex;
+        align-items:center;
+        gap:8px;
+        margin-top:12px;
+        padding:9px 11px;
+        border:1px solid var(--border);
+        border-radius:8px;
+        background:rgba(91,141,239,0.06);
+        color:var(--muted);
+        font-family:'JetBrains Mono',monospace;
+        font-size:11.5px;
+        line-height:1.4;
+      }
+
       .btn{
         display:inline-flex;
         align-items:center;
@@ -1476,6 +2198,8 @@ function Style() {
       .btn-ghost:hover{border-color:var(--muted);}
       .btn-danger{background:transparent; border-color:var(--red); color:var(--red); margin-top:22px;}
       .btn-danger:hover{background:rgba(217,105,95,0.1);}
+      .btn-danger-solid{background:var(--red); border-color:var(--red); color:#fff;}
+      .btn-danger-solid:hover:not(:disabled){opacity:.9;}
       .icon-btn{background:var(--panel-2); border:1px solid var(--border); color:var(--text); border-radius:8px; padding:7px; cursor:pointer;}
 
       .draft{margin-top:20px; padding-top:20px; border-top:1px dashed var(--border);}
@@ -1483,6 +2207,44 @@ function Style() {
       .field{display:flex; flex-direction:column; gap:5px;}
 
       /* location autocomplete */
+      .location-quick-row{
+        display:flex;
+        gap:6px;
+        flex-wrap:wrap;
+        margin-bottom:7px;
+      }
+
+      .location-quick{
+        background:transparent;
+        border:1px solid var(--border);
+        color:var(--muted);
+        border-radius:20px;
+        padding:5px 10px;
+        font-size:11.5px;
+        cursor:pointer;
+        transition:all .15s ease;
+      }
+
+      .location-quick:hover{
+        border-color:var(--muted);
+        color:var(--text);
+      }
+
+      .location-quick.active{
+        border-color:var(--amber);
+        color:var(--amber);
+        background:rgba(232,163,61,0.08);
+      }
+
+      .location-remote-note{
+        padding:9px 11px;
+        border:1px dashed var(--border);
+        border-radius:8px;
+        color:var(--muted);
+        font-size:12px;
+        background:rgba(63,167,150,0.05);
+      }
+
       .location-input-wrap{
         position:relative;
       }
@@ -1580,6 +2342,21 @@ function Style() {
       }
 
       .drawer-head{display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;}
+      .drawer-head-actions{display:flex; align-items:center; gap:10px;}
+      .btn-compact{padding:7px 10px; font-size:12px;}
+      .edit-application{margin-top:4px;}
+      .edit-grid{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
+      .edit-description-field{margin-top:14px;}
+      .job-description{
+        margin:8px 0 0;
+        color:var(--text);
+        font-size:12.5px;
+        line-height:1.6;
+        white-space:pre-wrap;
+        max-height:220px;
+        overflow-y:auto;
+        padding-right:4px;
+      }
       .drawer-title{font-family:'Space Grotesk',sans-serif; font-size:21px; margin:0;}
       .drawer-company{font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin:4px 0 14px;}
       .drawer-meta{display:flex; flex-direction:column; gap:7px; font-size:13px; color:var(--muted); margin-bottom:18px;}
@@ -1603,6 +2380,38 @@ function Style() {
       .stage-pill-reject.active{border-color:var(--red); color:var(--red); background:rgba(217,105,95,0.1);}
 
       .section{margin-bottom:18px; padding-top:16px; border-top:1px dashed var(--border);}
+
+      .delete-confirm{
+        margin-top:22px;
+        padding:14px;
+        border:1px solid rgba(217,105,95,0.55);
+        border-radius:9px;
+        background:rgba(217,105,95,0.08);
+      }
+
+      .delete-confirm-copy{
+        display:flex;
+        align-items:flex-start;
+        gap:10px;
+        color:var(--red);
+      }
+
+      .delete-confirm-copy strong{
+        display:block;
+        font-size:13.5px;
+        margin-bottom:3px;
+      }
+
+      .delete-confirm-copy p{
+        margin:0;
+        color:var(--muted);
+        font-size:12.5px;
+        line-height:1.45;
+      }
+
+      .delete-confirm-actions{
+        margin-top:12px;
+      }
       .tip-list, .question-list{margin:8px 0 0; padding-left:18px; font-size:13px; line-height:1.6; color:var(--text);}
       .question-list{font-family:'Inter',sans-serif;}
 
@@ -1635,6 +2444,7 @@ function Style() {
 
       @media(max-width:640px){
         .draft-grid{grid-template-columns:1fr;}
+        .edit-grid{grid-template-columns:1fr;}
         .topbar{padding:14px 16px;}
         .main{padding:18px 14px;}
         .panel{padding:18px;}
