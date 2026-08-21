@@ -193,6 +193,10 @@ export default function App() {
   const [session, setSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [recalculating, setRecalculating] = useState(false);
+  const [passwordRecovery, setPasswordRecovery] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("reset") === "1";
+  });
   const [jobPostDraft, setJobPostDraft] = useState(() => {
     try {
       return localStorage.getItem("applypilot_job_post_draft") || "";
@@ -219,8 +223,12 @@ export default function App() {
 
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
+    } = supabase.auth.onAuthStateChange((event, session) => {
       setSession(session);
+
+      if (event === "PASSWORD_RECOVERY") {
+        setPasswordRecovery(true);
+      }
     });
 
     return () => {
@@ -481,16 +489,20 @@ const updateApplication = useCallback(
       return false;
     }
 
-    // Update the ApplyPilot UI immediately
+    // Keep a snapshot so we can roll back if Supabase fails.
+    let previousApplication = null;
+
     setApplications((current) =>
-      current.map((app) =>
-        app.id === id
-          ? {
-              ...app,
-              ...patch,
-            }
-          : app
-      )
+      current.map((app) => {
+        if (app.id !== id) return app;
+
+        previousApplication = { ...app };
+
+        return {
+          ...app,
+          ...patch,
+        };
+      })
     );
 
     const dbPatch = {};
@@ -517,7 +529,19 @@ const updateApplication = useCallback(
 
     if (error) {
       console.error("Supabase update failed:", error);
-      pushToast("Couldn't update application.", "error");
+
+      if (previousApplication) {
+        setApplications((current) =>
+          current.map((app) =>
+            app.id === id ? previousApplication : app
+          )
+        );
+      }
+
+      pushToast(
+        "Couldn't update application. Previous changes were restored.",
+        "error"
+      );
       return false;
     }
 
@@ -573,6 +597,26 @@ if (authLoading) {
   );
 }
 
+if (passwordRecovery && session) {
+  return (
+    <div className="app">
+      <Style />
+      <PasswordResetView
+        pushToast={pushToast}
+        onComplete={async () => {
+          setPasswordRecovery(false);
+
+          const cleanUrl = `${window.location.origin}${window.location.pathname}`;
+          window.history.replaceState({}, document.title, cleanUrl);
+
+          await supabase.auth.signOut();
+        }}
+      />
+      <Toasts toasts={toasts} />
+    </div>
+  );
+}
+
 if (!session) {
   return (
     <div className="app">
@@ -604,6 +648,7 @@ return (
       ) : view === "add" ? (
         <AddFlight
           resumeText={resume.text}
+          applications={applications}
           onAdd={addApplication}
           onCancel={() => setView("dashboard")}
           pushToast={pushToast}
@@ -764,6 +809,38 @@ function AuthView({ pushToast }) {
     }
   };
 
+  const sendResetEmail = async () => {
+    if (!email.trim()) {
+      pushToast("Enter your email first.", "error");
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      const redirectTo = `${window.location.origin}/?reset=1`;
+
+      const { error } = await supabase.auth.resetPasswordForEmail(
+        email.trim(),
+        { redirectTo }
+      );
+
+      if (error) throw error;
+
+      pushToast(
+        "Password reset email sent. Check your inbox.",
+        "success"
+      );
+    } catch (error) {
+      pushToast(
+        error.message || "Couldn't send password reset email.",
+        "error"
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <div className="auth-screen">
       <div className="auth-card">
@@ -813,6 +890,17 @@ function AuthView({ pushToast }) {
             />
           </label>
 
+          {mode === "login" && (
+            <button
+              className="auth-forgot"
+              type="button"
+              onClick={sendResetEmail}
+              disabled={loading}
+            >
+              Forgot password?
+            </button>
+          )}
+
           <button
             className="btn btn-primary auth-submit"
             type="submit"
@@ -836,6 +924,105 @@ function AuthView({ pushToast }) {
             ? "Need an account? Sign up"
             : "Already have an account? Sign in"}
         </button>
+      </div>
+    </div>
+  );
+}
+
+function PasswordResetView({ pushToast, onComplete }) {
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const saveNewPassword = async (e) => {
+    e.preventDefault();
+
+    if (password.length < 6) {
+      pushToast("Password must be at least 6 characters.", "error");
+      return;
+    }
+
+    if (password !== confirmPassword) {
+      pushToast("Passwords do not match.", "error");
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      const { error } = await supabase.auth.updateUser({
+        password,
+      });
+
+      if (error) throw error;
+
+      pushToast("Password updated. Sign in with your new password.", "success");
+      await onComplete();
+    } catch (error) {
+      pushToast(
+        error.message || "Couldn't update your password.",
+        "error"
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="auth-screen">
+      <div className="auth-card">
+        <div className="brand auth-brand">
+          <span className="brand-mark">
+            <Plane size={18} />
+          </span>
+
+          <div className="brand-text">
+            <span className="brand-name">ApplyPilot</span>
+            <span className="brand-tag">
+              MISSION CONTROL FOR YOUR JOB SEARCH
+            </span>
+          </div>
+        </div>
+
+        <h1 className="auth-title">Set a new password</h1>
+        <p className="auth-sub">
+          Enter a new password for your ApplyPilot account.
+        </p>
+
+        <form onSubmit={saveNewPassword}>
+          <label className="field">
+            <span className="mini-label">New password</span>
+            <input
+              className="input"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="••••••••"
+              autoComplete="new-password"
+            />
+          </label>
+
+          <label className="field auth-password">
+            <span className="mini-label">Confirm password</span>
+            <input
+              className="input"
+              type="password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              placeholder="••••••••"
+              autoComplete="new-password"
+            />
+          </label>
+
+          <button
+            className="btn btn-primary auth-submit"
+            type="submit"
+            disabled={loading}
+          >
+            {loading && <Loader2 className="spin" size={16} />}
+            {loading ? "Updating password…" : "Update password"}
+          </button>
+        </form>
       </div>
     </div>
   );
@@ -901,6 +1088,10 @@ function TopBar({ view, setView }) {
 
 /* --------------------------- dashboard --------------------------- */
 function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [locationFilter, setLocationFilter] = useState("all");
+
   if (applications.length === 0) {
     return (
       <div className="empty">
@@ -914,28 +1105,128 @@ function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
     );
   }
 
+  const normalizedSearch = search.trim().toLowerCase();
+
+  const filteredApplications = applications.filter((app) => {
+    const company = (app.company || "").toLowerCase();
+    const position = (app.position || "").toLowerCase();
+    const parsedLocation = parseLocationValue(app.location);
+
+    const matchesSearch =
+      !normalizedSearch ||
+      company.includes(normalizedSearch) ||
+      position.includes(normalizedSearch);
+
+    const matchesStatus =
+      statusFilter === "all" || app.status === statusFilter;
+
+    const matchesLocation =
+      locationFilter === "all" || parsedLocation.mode === locationFilter;
+
+    return matchesSearch && matchesStatus && matchesLocation;
+  });
+
+  const filtersActive =
+    !!normalizedSearch ||
+    statusFilter !== "all" ||
+    locationFilter !== "all";
+
+  const clearFilters = () => {
+    setSearch("");
+    setStatusFilter("all");
+    setLocationFilter("all");
+  };
+
   return (
-    <div className="board">
-      {STATUS_ORDER.map((status) => {
-        const items = applications.filter((a) => a.status === status);
-        const meta = STATUS_META[status];
-        return (
-          <div className="column" key={status}>
-            <div className="column-head">
-              <span className="column-dot" style={{ background: meta.color }} />
-              <span className="column-title">{meta.label}</span>
-              <span className="column-count">{items.length}</span>
-            </div>
-            <div className="column-body">
-              {items.length === 0 && <div className="column-empty">No flights here</div>}
-              {items.map((a) => (
-                <FlightStrip key={a.id} app={a} onSelect={() => onSelect(a.id)} />
-              ))}
-            </div>
-          </div>
-        );
-      })}
-    </div>
+    <>
+      <div className="dashboard-toolbar">
+        <div className="dashboard-search-wrap">
+          <input
+            className="input dashboard-search"
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search company or position..."
+          />
+        </div>
+
+        <select
+          className="input dashboard-filter"
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value)}
+        >
+          <option value="all">All statuses</option>
+          <option value="saved">Saved</option>
+          <option value="applied">Applied</option>
+          <option value="interview">Interview</option>
+          <option value="offer">Offer</option>
+          <option value="rejected">Rejected</option>
+        </select>
+
+        <select
+          className="input dashboard-filter"
+          value={locationFilter}
+          onChange={(e) => setLocationFilter(e.target.value)}
+        >
+          <option value="all">All locations</option>
+          <option value="in-person">In person</option>
+          <option value="remote">Remote</option>
+          <option value="hybrid">Hybrid</option>
+        </select>
+
+        {filtersActive && (
+          <button
+            className="btn btn-ghost dashboard-clear"
+            onClick={clearFilters}
+            type="button"
+          >
+            Clear filters
+          </button>
+        )}
+      </div>
+
+      {filteredApplications.length === 0 ? (
+        <div className="dashboard-no-results">
+          <Radar size={24} />
+          <strong>No matching applications</strong>
+          <span>Try changing your search or filters.</span>
+          <button
+            className="btn btn-ghost"
+            type="button"
+            onClick={clearFilters}
+          >
+            Clear filters
+          </button>
+        </div>
+      ) : (
+        <div className="board">
+          {STATUS_ORDER.map((status) => {
+            if (statusFilter !== "all" && status !== statusFilter) {
+              return null;
+            }
+
+            const items = filteredApplications.filter((a) => a.status === status);
+            const meta = STATUS_META[status];
+
+            return (
+              <div className="column" key={status}>
+                <div className="column-head">
+                  <span className="column-dot" style={{ background: meta.color }} />
+                  <span className="column-title">{meta.label}</span>
+                  <span className="column-count">{items.length}</span>
+                </div>
+                <div className="column-body">
+                  {items.length === 0 && <div className="column-empty">No matching flights</div>}
+                  {items.map((a) => (
+                    <FlightStrip key={a.id} app={a} onSelect={() => onSelect(a.id)} />
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -980,6 +1271,7 @@ function matchUserPrompt(app, resumeText) {
 
 function AddFlight({
   resumeText,
+  applications,
   onAdd,
   onCancel,
   pushToast,
@@ -995,6 +1287,7 @@ function AddFlight({
   const [matching, setMatching] = useState(false);
   const [logging, setLogging] = useState(false);
   const [draft, setDraft] = useState(initialDraft || null);
+  const [duplicateMatch, setDuplicateMatch] = useState(null);
 
   useEffect(() => {
     setText(initialText || "");
@@ -1076,6 +1369,24 @@ function AddFlight({
     }
   };
 
+  const logDraft = async () => {
+    setLogging(true);
+
+    try {
+      const success = await onAdd(draft);
+
+      if (success !== false) {
+        setDuplicateMatch(null);
+        setDraft(null);
+        setText("");
+        onClearText();
+        onClearDraft();
+      }
+    } finally {
+      setLogging(false);
+    }
+  };
+
   const handleLogFlight = async () => {
     if (!draft || logging) return;
 
@@ -1087,20 +1398,27 @@ function AddFlight({
       return;
     }
 
-    setLogging(true);
+    const normalizedCompany = (draft.company || "").trim().toLowerCase();
+    const normalizedPosition = (draft.position || "").trim().toLowerCase();
 
-    try {
-      const success = await onAdd(draft);
+    const duplicate = (applications || []).find(
+      (app) =>
+        (app.company || "").trim().toLowerCase() === normalizedCompany &&
+        (app.position || "").trim().toLowerCase() === normalizedPosition
+    );
 
-      if (success !== false) {
-        setDraft(null);
-        setText("");
-        onClearText();
-        onClearDraft();
-      }
-    } finally {
-      setLogging(false);
+    if (duplicate) {
+      setDuplicateMatch(duplicate);
+      return;
     }
+
+    await logDraft();
+  };
+
+  const logDuplicateAnyway = async () => {
+    if (!draft || logging) return;
+    setDuplicateMatch(null);
+    await logDraft();
   };
 
   return (
@@ -1157,6 +1475,7 @@ function AddFlight({
               value={draft.company}
               onChange={(v) => {
                 const nextDraft = { ...draft, company: v };
+                setDuplicateMatch(null);
                 setDraft(nextDraft);
                 onDraftChange(nextDraft);
               }}
@@ -1166,6 +1485,7 @@ function AddFlight({
               value={draft.position}
               onChange={(v) => {
                 const nextDraft = { ...draft, position: v };
+                setDuplicateMatch(null);
                 setDraft(nextDraft);
                 onDraftChange(nextDraft);
               }}
@@ -1246,6 +1566,41 @@ function AddFlight({
             </div>
           )}
 
+          {duplicateMatch && (
+            <div className="duplicate-warning fade-in">
+              <div className="duplicate-warning-copy">
+                <AlertCircle size={16} />
+                <div>
+                  <strong>Possible duplicate application</strong>
+                  <p>
+                    You already logged {duplicateMatch.company} — {duplicateMatch.position}.
+                    Do you want to log this job again?
+                  </p>
+                </div>
+              </div>
+
+              <div className="row-actions duplicate-warning-actions">
+                <button
+                  className="btn btn-primary"
+                  onClick={logDuplicateAnyway}
+                  disabled={logging}
+                >
+                  {logging ? <Loader2 className="spin" size={15} /> : <Plus size={15} />}
+                  {logging ? "Logging flight…" : "Log anyway"}
+                </button>
+
+                <button
+                  className="btn btn-ghost"
+                  onClick={() => setDuplicateMatch(null)}
+                  disabled={logging}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
+          {!duplicateMatch && (
           <div className="row-actions">
             <button
               className="btn btn-primary"
@@ -1271,6 +1626,7 @@ function AddFlight({
               Discard parsed result
             </button>
           </div>
+          )}
         </div>
       )}
     </div>
@@ -1414,31 +1770,15 @@ function LocationField({ value, onChange }) {
         <MapPin size={12} /> Location
       </span>
 
-      <div className="location-quick-row">
-        <button
-          type="button"
-          className={"location-quick" + (workMode === "remote" ? " active" : "")}
-          onClick={() => selectMode("remote")}
-        >
-          Remote
-        </button>
-
-        <button
-          type="button"
-          className={"location-quick" + (workMode === "hybrid" ? " active" : "")}
-          onClick={() => selectMode("hybrid")}
-        >
-          Hybrid
-        </button>
-
-        <button
-          type="button"
-          className={"location-quick" + (workMode === "in-person" ? " active" : "")}
-          onClick={() => selectMode("in-person")}
-        >
-          In person
-        </button>
-      </div>
+      <select
+        className="input location-mode-select"
+        value={workMode}
+        onChange={(e) => selectMode(e.target.value)}
+      >
+        <option value="in-person">In person</option>
+        <option value="remote">Remote</option>
+        <option value="hybrid">Hybrid</option>
+      </select>
 
       {workMode === "remote" ? (
         <div className="location-remote-note">
@@ -2055,6 +2395,26 @@ function Style() {
         white-space:nowrap;
       }
 
+      .auth-forgot{
+        display:block;
+        margin:8px 0 12px auto;
+        padding:0;
+        background:transparent;
+        border:none;
+        color:var(--muted);
+        font-size:12px;
+        cursor:pointer;
+      }
+
+      .auth-forgot:hover:not(:disabled){
+        color:var(--amber);
+      }
+
+      .auth-forgot:disabled{
+        opacity:.55;
+        cursor:not-allowed;
+      }
+
 
 
 
@@ -2089,6 +2449,49 @@ function Style() {
 
       .empty h2{font-family:'Space Grotesk',sans-serif; color:var(--text); font-size:20px; margin:4px 0 0;}
       .empty p{font-size:14px; margin:0 0 8px;}
+
+      /* dashboard search + filters */
+      .dashboard-toolbar{
+        display:grid;
+        grid-template-columns:minmax(220px, 1.6fr) minmax(150px, .7fr) minmax(150px, .7fr) auto;
+        gap:10px;
+        align-items:center;
+        margin-bottom:18px;
+      }
+
+      .dashboard-search,
+      .dashboard-filter{
+        min-height:40px;
+      }
+
+      .dashboard-filter{
+        cursor:pointer;
+      }
+
+      .dashboard-clear{
+        white-space:nowrap;
+      }
+
+      .dashboard-no-results{
+        display:flex;
+        flex-direction:column;
+        align-items:center;
+        justify-content:center;
+        gap:8px;
+        text-align:center;
+        padding:70px 20px;
+        color:var(--muted);
+      }
+
+      .dashboard-no-results strong{
+        color:var(--text);
+        font-family:'Space Grotesk',sans-serif;
+        font-size:18px;
+      }
+
+      .dashboard-no-results span{
+        font-size:13px;
+      }
 
       /* board */
       .board{display:flex; gap:16px; overflow-x:auto; padding-bottom:14px;}
@@ -2207,6 +2610,11 @@ function Style() {
       .field{display:flex; flex-direction:column; gap:5px;}
 
       /* location autocomplete */
+      .location-mode-select{
+        margin-bottom:7px;
+        cursor:pointer;
+      }
+
       .location-quick-row{
         display:flex;
         gap:6px;
@@ -2381,6 +2789,38 @@ function Style() {
 
       .section{margin-bottom:18px; padding-top:16px; border-top:1px dashed var(--border);}
 
+      .duplicate-warning{
+        margin-top:16px;
+        padding:14px;
+        border:1px solid rgba(232,163,61,0.55);
+        border-radius:9px;
+        background:rgba(232,163,61,0.08);
+      }
+
+      .duplicate-warning-copy{
+        display:flex;
+        align-items:flex-start;
+        gap:10px;
+        color:var(--amber);
+      }
+
+      .duplicate-warning-copy strong{
+        display:block;
+        font-size:13.5px;
+        margin-bottom:3px;
+      }
+
+      .duplicate-warning-copy p{
+        margin:0;
+        color:var(--muted);
+        font-size:12.5px;
+        line-height:1.45;
+      }
+
+      .duplicate-warning-actions{
+        margin-top:12px;
+      }
+
       .delete-confirm{
         margin-top:22px;
         padding:14px;
@@ -2442,7 +2882,25 @@ function Style() {
       .toast-success{border-color:var(--teal);}
       .toast-error{border-color:var(--red);}
 
+      @media(max-width:820px){
+        .dashboard-toolbar{
+          grid-template-columns:1fr 1fr;
+        }
+
+        .dashboard-search-wrap{
+          grid-column:1 / -1;
+        }
+      }
+
       @media(max-width:640px){
+        .dashboard-toolbar{
+          grid-template-columns:1fr;
+        }
+
+        .dashboard-search-wrap{
+          grid-column:auto;
+        }
+
         .draft-grid{grid-template-columns:1fr;}
         .edit-grid{grid-template-columns:1fr;}
         .topbar{padding:14px 16px;}
