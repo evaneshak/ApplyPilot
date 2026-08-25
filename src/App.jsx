@@ -2457,6 +2457,7 @@ function FlightDrawer({
   const [editSaving, setEditSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleteLoading, setDeleteLoading] = useState(false);
+  const [showScoreReason, setShowScoreReason] = useState(false);
   const [editDraft, setEditDraft] = useState({
     company: app.company || "",
     position: app.position || "",
@@ -2575,6 +2576,18 @@ function FlightDrawer({
                 <Pencil size={14} /> Edit
               </button>
             )}
+
+            {!editing && app.reason && (
+              <button
+                className={"score-reason-toggle" + (showScoreReason ? " active" : "")}
+                type="button"
+                onClick={() => setShowScoreReason((current) => !current)}
+                aria-expanded={showScoreReason}
+              >
+                {showScoreReason ? "Hide reason" : "Why this score?"}
+              </button>
+            )}
+
             <MatchGauge value={app.match} size={40} />
           </div>
         </div>
@@ -2647,6 +2660,16 @@ function FlightDrawer({
             <h2 className="drawer-title">{app.position || "Untitled role"}</h2>
             <p className="drawer-company">{app.company || "Unknown company"}</p>
 
+            {app.reason && showScoreReason && (
+              <div className="score-reason-panel fade-in">
+                <div className="score-reason-panel-head">
+                  <Sparkles size={14} />
+                  <span>Why {app.match ?? "this"}%?</span>
+                </div>
+                <p>{app.reason}</p>
+              </div>
+            )}
+
             <div className="drawer-meta">
               {app.location && <span><MapPin size={13} /> {app.location}</span>}
               {app.salary && <span><DollarSign size={13} /> {app.salary}</span>}
@@ -2708,11 +2731,6 @@ function FlightDrawer({
                   </Section>
                 )}
 
-                {app.reason && (
-                  <Section title="Why this score">
-                    <p className="match-reason-text">{app.reason}</p>
-                  </Section>
-                )}
               </>
             ) : (
               <div className="hint"><AlertCircle size={13} /> Add a resume to unlock matching and interview prep.</div>
@@ -3405,7 +3423,54 @@ function Style() {
       }
 
       .drawer-head{display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;}
-      .drawer-head-actions{display:flex; align-items:center; gap:10px;}
+      .drawer-head-actions{display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end;}
+
+      .score-reason-toggle{
+        background:transparent;
+        border:1px solid var(--border);
+        color:var(--muted);
+        border-radius:20px;
+        padding:6px 10px;
+        font-size:11.5px;
+        font-weight:600;
+        cursor:pointer;
+        white-space:nowrap;
+        transition:all .15s ease;
+      }
+
+      .score-reason-toggle:hover,
+      .score-reason-toggle.active{
+        border-color:var(--blue);
+        color:var(--blue);
+        background:rgba(91,141,239,0.08);
+      }
+
+      .score-reason-panel{
+        margin:0 0 16px;
+        padding:12px 13px;
+        border:1px solid rgba(91,141,239,0.45);
+        border-radius:9px;
+        background:rgba(91,141,239,0.08);
+      }
+
+      .score-reason-panel-head{
+        display:flex;
+        align-items:center;
+        gap:6px;
+        color:var(--blue);
+        font-family:'JetBrains Mono',monospace;
+        font-size:10.5px;
+        letter-spacing:.6px;
+        text-transform:uppercase;
+      }
+
+      .score-reason-panel p{
+        margin:7px 0 0;
+        color:var(--text);
+        font-size:12.5px;
+        line-height:1.55;
+      }
+
       .btn-compact{padding:7px 10px; font-size:12px;}
       .edit-application{margin-top:4px;}
       .edit-grid{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
@@ -3566,6 +3631,15 @@ function Style() {
 
         .draft-grid{grid-template-columns:1fr;}
         .edit-grid{grid-template-columns:1fr;}
+
+        .drawer-head{
+          align-items:flex-start;
+        }
+
+        .drawer-head-actions{
+          max-width:75%;
+        }
+
         .topbar{padding:14px 16px;}
         .main{padding:18px 14px;}
         .panel{padding:18px;}
