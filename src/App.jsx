@@ -193,6 +193,10 @@ export default function App() {
   const [session, setSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [recalculating, setRecalculating] = useState(false);
+  const [recalculationProgress, setRecalculationProgress] = useState({
+    completed: 0,
+    total: 0,
+  });
   const [passwordRecovery, setPasswordRecovery] = useState(() => {
     const params = new URLSearchParams(window.location.search);
     return params.get("reset") === "1";
@@ -322,6 +326,7 @@ useEffect(() => {
       have: app.have || [],
       missing: app.missing || [],
       suggestions: app.suggestions || [],
+      reason: app.reason || "",
       questions: app.questions || [],
       createdAt: app.created_at,
     }));
@@ -434,6 +439,7 @@ const addApplication = useCallback(
         have: app.have || [],
         missing: app.missing || [],
         suggestions: app.suggestions || [],
+        reason: app.reason || "",
         questions: app.questions || [],
       })
       .select()
@@ -461,6 +467,7 @@ const addApplication = useCallback(
       have: data.have || [],
       missing: data.missing || [],
       suggestions: data.suggestions || [],
+      reason: data.reason || "",
       questions: data.questions || [],
       createdAt: data.created_at,
     };
@@ -519,6 +526,7 @@ const updateApplication = useCallback(
     if (patch.have !== undefined) dbPatch.have = patch.have;
     if (patch.missing !== undefined) dbPatch.missing = patch.missing;
     if (patch.suggestions !== undefined) dbPatch.suggestions = patch.suggestions;
+    if (patch.reason !== undefined) dbPatch.reason = patch.reason;
     if (patch.questions !== undefined) dbPatch.questions = patch.questions;
 
     const { error } = await supabase
@@ -665,6 +673,7 @@ return (
           onSave={persistResume}
           pushToast={pushToast}
           recalculating={recalculating}
+          recalculationProgress={recalculationProgress}
           onRecalculate={async () => {
             if (!resume.text) {
               pushToast("Add a resume first.", "error");
@@ -676,62 +685,151 @@ return (
               return;
             }
 
+            // Gemini free-tier safe recalculation.
+            // The API limit shown by Gemini is 20 requests/minute, so we avoid
+            // sending multiple match requests at once and space them out.
+            // If a request still fails (for example, a 429 quota response),
+            // wait long enough for the quota window to recover before retrying.
+            const MAX_ATTEMPTS = 3;
+            const BETWEEN_APPLICATIONS_MS = 4000;
+            const RATE_LIMIT_RETRY_MS = 45000;
+
+            const wait = (ms) =>
+              new Promise((resolve) => setTimeout(resolve, ms));
+
+            const isValidMatchResult = (parsed) =>
+              parsed &&
+              Number.isInteger(parsed.match) &&
+              parsed.match >= 0 &&
+              parsed.match <= 100 &&
+              Array.isArray(parsed.have) &&
+              Array.isArray(parsed.missing) &&
+              Array.isArray(parsed.suggestions) &&
+              typeof parsed.reason === "string" &&
+              parsed.reason.trim().length > 0;
+
             setRecalculating(true);
+            setRecalculationProgress({
+              completed: 0,
+              total: applications.length,
+            });
             pushToast("Recalculating matches…", "info");
 
             try {
-              const next = [];
+              const next = [...applications];
+              let succeeded = 0;
+              let failed = 0;
 
-              for (const a of applications) {
-                try {
-                  const raw = await callGemini(
-                    MATCH_SYSTEM,
-                    matchUserPrompt(a, resume.text)
-                  );
+              for (let currentIndex = 0; currentIndex < applications.length; currentIndex += 1) {
+                const app = applications[currentIndex];
+                let success = false;
+                let lastError = null;
 
-                  const parsed = safeParseJSON(raw);
+                for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+                  try {
+                    const raw = await callGemini(
+                      MATCH_SYSTEM,
+                      matchUserPrompt(app, resume.text)
+                    );
 
-                  next.push(
-                    parsed
-                      ? {
-                          ...a,
-                          match: parsed.match,
-                          have: parsed.have,
-                          missing: parsed.missing,
-                          suggestions: parsed.suggestions,
-                        }
-                      : a
-                  );
-                } catch (e) {
-                  next.push(a);
+                    const parsed = safeParseJSON(raw);
+
+                    if (!isValidMatchResult(parsed)) {
+                      throw new Error("Gemini returned an invalid match result.");
+                    }
+
+                    const updatedApp = {
+                      ...app,
+                      match: parsed.match,
+                      have: parsed.have,
+                      missing: parsed.missing,
+                      suggestions: parsed.suggestions,
+                      reason: parsed.reason.trim(),
+                    };
+
+                    const { error } = await supabase
+                      .from("Applications")
+                      .update({
+                        match: updatedApp.match,
+                        have: updatedApp.have,
+                        missing: updatedApp.missing,
+                        suggestions: updatedApp.suggestions,
+                        reason: updatedApp.reason,
+                      })
+                      .eq("id", updatedApp.id)
+                      .eq("user_id", session.user.id);
+
+                    if (error) throw error;
+
+                    next[currentIndex] = updatedApp;
+                    success = true;
+                    break;
+                  } catch (error) {
+                    lastError = error;
+
+                    console.error(
+                      `Recalculation attempt ${attempt}/${MAX_ATTEMPTS} failed for application ${app.id}:`,
+                      error
+                    );
+
+                    if (attempt < MAX_ATTEMPTS) {
+                      pushToast(
+                        `Gemini is busy. Waiting before retrying ${app.company || "this application"}…`,
+                        "info"
+                      );
+
+                      await wait(RATE_LIMIT_RETRY_MS);
+                    }
+                  }
                 }
-              }
 
-              for (const app of next) {
-                const { error } = await supabase
-                  .from("Applications")
-                  .update({
-                    match: app.match,
-                    have: app.have || [],
-                    missing: app.missing || [],
-                    suggestions: app.suggestions || [],
-                  })
-                  .eq("id", app.id)
-                  .eq("user_id", session.user.id);
-
-                if (error) {
+                if (success) {
+                  succeeded += 1;
+                } else {
+                  failed += 1;
                   console.error(
-                    "Failed to save recalculated match for application:",
+                    "Recalculation permanently failed:",
                     app.id,
-                    error
+                    lastError
                   );
+                }
+
+                setRecalculationProgress({
+                  completed: currentIndex + 1,
+                  total: applications.length,
+                });
+
+                // Keep requests comfortably below Gemini's free-tier
+                // per-minute quota. No need to wait after the final item.
+                if (currentIndex < applications.length - 1) {
+                  await wait(BETWEEN_APPLICATIONS_MS);
                 }
               }
 
               setApplications(next);
-              pushToast("Matches updated.", "success");
+
+              if (failed === 0) {
+                pushToast(
+                  `${succeeded} ${succeeded === 1 ? "match" : "matches"} updated.`,
+                  "success"
+                );
+              } else if (succeeded === 0) {
+                pushToast(
+                  `Recalculation failed for all ${failed} applications.`,
+                  "error"
+                );
+              } else {
+                pushToast(
+                  `${succeeded} updated, ${failed} failed.`,
+                  "error"
+                );
+              }
             } finally {
               setRecalculating(false);
+              setRecalculationProgress({
+                completed: 0,
+                total: 0,
+              });
             }
           }}
         />
@@ -1091,6 +1189,8 @@ function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [locationFilter, setLocationFilter] = useState("all");
+  const [deadlineFilter, setDeadlineFilter] = useState("all");
+  const [sortBy, setSortBy] = useState("smart");
 
   if (applications.length === 0) {
     return (
@@ -1105,12 +1205,32 @@ function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
     );
   }
 
+  const totalApplications = applications.length;
+  const appliedCount = applications.filter((a) => a.status === "applied").length;
+  const interviewCount = applications.filter((a) => a.status === "interview").length;
+  const offerCount = applications.filter((a) => a.status === "offer").length;
+  const rejectedCount = applications.filter((a) => a.status === "rejected").length;
+
+  const submittedCount = applications.filter((a) =>
+    ["applied", "interview", "offer", "rejected"].includes(a.status)
+  ).length;
+
+  const responseCount = applications.filter((a) =>
+    ["interview", "offer", "rejected"].includes(a.status)
+  ).length;
+
+  const responseRate =
+    submittedCount > 0
+      ? Math.round((responseCount / submittedCount) * 100)
+      : null;
+
   const normalizedSearch = search.trim().toLowerCase();
 
   const filteredApplications = applications.filter((app) => {
     const company = (app.company || "").toLowerCase();
     const position = (app.position || "").toLowerCase();
     const parsedLocation = parseLocationValue(app.location);
+    const dl = daysLeft(app.deadline);
 
     const matchesSearch =
       !normalizedSearch ||
@@ -1123,22 +1243,126 @@ function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
     const matchesLocation =
       locationFilter === "all" || parsedLocation.mode === locationFilter;
 
-    return matchesSearch && matchesStatus && matchesLocation;
+    let matchesDeadline = true;
+
+    if (deadlineFilter === "soon") {
+      matchesDeadline = dl !== null && dl >= 0 && dl <= 7;
+    } else if (deadlineFilter === "overdue") {
+      matchesDeadline = dl !== null && dl < 0;
+    } else if (deadlineFilter === "none") {
+      matchesDeadline = !app.deadline;
+    }
+
+    return (
+      matchesSearch &&
+      matchesStatus &&
+      matchesLocation &&
+      matchesDeadline
+    );
   });
+
+  const sortApplications = (items, status) => {
+    const sorted = [...items];
+
+    const deadlineTime = (app) => {
+      if (!app.deadline) return Number.POSITIVE_INFINITY;
+      const time = new Date(app.deadline).getTime();
+      return Number.isNaN(time) ? Number.POSITIVE_INFINITY : time;
+    };
+
+    const createdTime = (app) => {
+      const time = new Date(app.createdAt || 0).getTime();
+      return Number.isNaN(time) ? 0 : time;
+    };
+
+    if (sortBy === "smart") {
+      if (status === "saved") {
+        return sorted.sort((a, b) => deadlineTime(a) - deadlineTime(b));
+      }
+
+      return sorted.sort((a, b) => createdTime(b) - createdTime(a));
+    }
+
+    if (sortBy === "newest") {
+      return sorted.sort((a, b) => createdTime(b) - createdTime(a));
+    }
+
+    if (sortBy === "oldest") {
+      return sorted.sort((a, b) => createdTime(a) - createdTime(b));
+    }
+
+    if (sortBy === "deadline") {
+      return sorted.sort((a, b) => deadlineTime(a) - deadlineTime(b));
+    }
+
+    if (sortBy === "company") {
+      return sorted.sort((a, b) =>
+        (a.company || "").localeCompare(b.company || "")
+      );
+    }
+
+    if (sortBy === "match") {
+      return sorted.sort((a, b) => {
+        const aMatch = a.match ?? -1;
+        const bMatch = b.match ?? -1;
+        return bMatch - aMatch;
+      });
+    }
+
+    return sorted;
+  };
 
   const filtersActive =
     !!normalizedSearch ||
     statusFilter !== "all" ||
-    locationFilter !== "all";
+    locationFilter !== "all" ||
+    deadlineFilter !== "all" ||
+    sortBy !== "smart";
 
   const clearFilters = () => {
     setSearch("");
     setStatusFilter("all");
     setLocationFilter("all");
+    setDeadlineFilter("all");
+    setSortBy("smart");
   };
 
   return (
     <>
+      <div className="dashboard-stats">
+        <div className="stat-card">
+          <span className="stat-label">Total applications</span>
+          <strong className="stat-value">{totalApplications}</strong>
+        </div>
+
+        <div className="stat-card">
+          <span className="stat-label">Applied</span>
+          <strong className="stat-value">{appliedCount}</strong>
+        </div>
+
+        <div className="stat-card">
+          <span className="stat-label">Interviews</span>
+          <strong className="stat-value">{interviewCount}</strong>
+        </div>
+
+        <div className="stat-card">
+          <span className="stat-label">Offers</span>
+          <strong className="stat-value">{offerCount}</strong>
+        </div>
+
+        <div className="stat-card">
+          <span className="stat-label">Rejected</span>
+          <strong className="stat-value">{rejectedCount}</strong>
+        </div>
+
+        <div className="stat-card">
+          <span className="stat-label">Response rate</span>
+          <strong className="stat-value">
+            {responseRate === null ? "—" : `${responseRate}%`}
+          </strong>
+        </div>
+      </div>
+
       <div className="dashboard-toolbar">
         <div className="dashboard-search-wrap">
           <input
@@ -1174,6 +1398,30 @@ function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
           <option value="hybrid">Hybrid</option>
         </select>
 
+        <select
+          className="input dashboard-filter"
+          value={deadlineFilter}
+          onChange={(e) => setDeadlineFilter(e.target.value)}
+        >
+          <option value="all">All deadlines</option>
+          <option value="soon">Deadline soon (7 days)</option>
+          <option value="overdue">Overdue</option>
+          <option value="none">No deadline</option>
+        </select>
+
+        <select
+          className="input dashboard-filter"
+          value={sortBy}
+          onChange={(e) => setSortBy(e.target.value)}
+        >
+          <option value="smart">Smart sort</option>
+          <option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option>
+          <option value="deadline">Nearest deadline</option>
+          <option value="company">Company A–Z</option>
+          <option value="match">Highest match</option>
+        </select>
+
         {filtersActive && (
           <button
             className="btn btn-ghost dashboard-clear"
@@ -1189,7 +1437,7 @@ function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
         <div className="dashboard-no-results">
           <Radar size={24} />
           <strong>No matching applications</strong>
-          <span>Try changing your search or filters.</span>
+          <span>Try changing your search, filters, or sorting.</span>
           <button
             className="btn btn-ghost"
             type="button"
@@ -1205,7 +1453,11 @@ function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
               return null;
             }
 
-            const items = filteredApplications.filter((a) => a.status === status);
+            const items = sortApplications(
+              filteredApplications.filter((a) => a.status === status),
+              status
+            );
+
             const meta = STATUS_META[status];
 
             return (
@@ -1215,10 +1467,18 @@ function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
                   <span className="column-title">{meta.label}</span>
                   <span className="column-count">{items.length}</span>
                 </div>
+
                 <div className="column-body">
-                  {items.length === 0 && <div className="column-empty">No matching flights</div>}
+                  {items.length === 0 && (
+                    <div className="column-empty">No matching flights</div>
+                  )}
+
                   {items.map((a) => (
-                    <FlightStrip key={a.id} app={a} onSelect={() => onSelect(a.id)} />
+                    <FlightStrip
+                      key={a.id}
+                      app={a}
+                      onSelect={() => onSelect(a.id)}
+                    />
                   ))}
                 </div>
               </div>
@@ -1233,20 +1493,41 @@ function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
 function FlightStrip({ app, onSelect }) {
   const meta = STATUS_META[app.status];
   const dl = daysLeft(app.deadline);
+
+  const deadlineClass =
+    dl !== null && dl < 0
+      ? " overdue"
+      : dl !== null && dl <= 7
+      ? " deadline-soon"
+      : "";
+
   return (
-    <button className="strip" onClick={onSelect}>
+    <button
+      className={"strip" + deadlineClass}
+      onClick={onSelect}
+    >
       <span className="strip-tab" style={{ background: meta.color }} />
       <div className="strip-body">
         <div className="strip-row strip-row-top">
           <span className="strip-company">{app.company || "Unknown company"}</span>
           <MatchGauge value={app.match} size={34} />
         </div>
+
         <div className="strip-position">{app.position || "Untitled role"}</div>
+
         <div className="strip-row strip-meta">
-          {app.location && <span className="strip-meta-item"><MapPin size={11} /> {app.location}</span>}
+          {app.location && (
+            <span className="strip-meta-item">
+              <MapPin size={11} /> {app.location}
+            </span>
+          )}
+
           {app.deadline && (
-            <span className={"strip-meta-item" + (dl !== null && dl <= 5 && dl >= 0 ? " urgent" : "")}>
-              <CalendarClock size={11} /> {app.deadline}{dl !== null && dl >= 0 ? " · " + dl + "d" : ""}
+            <span className={"strip-meta-item" + deadlineClass}>
+              <CalendarClock size={11} />
+              {app.deadline}
+              {dl !== null && dl >= 0 ? ` · ${dl}d` : ""}
+              {dl !== null && dl < 0 ? " · overdue" : ""}
             </span>
           )}
         </div>
@@ -1260,7 +1541,8 @@ const EXTRACT_SYSTEM =
   "You extract structured data from a job posting. Respond with ONLY a raw JSON object, no markdown fences, no commentary, no explanation. Schema: {\"company\": string|null, \"position\": string|null, \"location\": string|null, \"salary\": string|null, \"deadline\": string|null, \"skills\": string[]}. For location/work arrangement: return exactly \"Remote\" for fully remote roles. For hybrid roles, return \"Hybrid — CITY/REGION\" when a city or region is provided, otherwise return \"Hybrid\". For on-site/in-person roles, return \"In person — CITY/REGION\" when a city or region is provided, otherwise return \"In person\". Use null only when neither work arrangement nor location can be determined. Limit skills to at most 8 short items (e.g. \"Python\", \"AWS\").";
 
 const MATCH_SYSTEM =
-  "You compare a candidate's resume against a job posting. Respond with ONLY a raw JSON object, no markdown fences, no commentary. Schema: {\"match\": number (0-100 integer), \"have\": string[] (skills/experience the resume already shows that the job wants), \"missing\": string[] (skills the job wants that the resume does not show), \"suggestions\": string[] (at most 2 short, concrete resume-wording tips, each under 25 words, written in your own words, no quotations)}.";
+  "You compare a candidate's resume against a job posting. Respond with ONLY a raw JSON object, no markdown fences, no commentary. Schema: {\"match\": number (0-100 integer), \"have\": string[], \"missing\": string[], \"suggestions\": string[], \"reason\": string}. Score consistently using this rubric: 90-100 = excellent match with nearly all core requirements shown; 75-89 = strong match with most core requirements shown and only limited gaps; 60-74 = moderate match with several relevant strengths but meaningful missing requirements; 40-59 = weak match with partial overlap; 0-39 = poor match with little relevant evidence. Base the score primarily on required skills, experience, tools, education, and responsibilities explicitly present in the job posting. Do not award points for skills that are only implied but not shown in the resume. In \"have\", include only clearly supported relevant qualifications already shown in the resume. In \"missing\", include only important job requirements that are clearly absent from the resume; do not list generic soft skills or minor nice-to-haves unless the posting emphasizes them. Limit \"missing\" to at most 5 concise items. In \"suggestions\", provide at most 2 short, concrete resume-improvement suggestions, each under 25 words, and never tell the candidate to claim experience they do not have. In \"reason\", write one concise sentence explaining the score based on the strongest matches and most important gaps.";
+
 
 function matchUserPrompt(app, resumeText) {
   return "JOB SKILLS: " + (app.skills || []).join(", ") +
@@ -1325,6 +1607,7 @@ function AddFlight({
       let have = [];
       let missing = [];
       let suggestions = [];
+      let reason = "";
 
       if (resumeText) {
         setMatching(true);
@@ -1342,6 +1625,7 @@ function AddFlight({
             have = mp.have || [];
             missing = mp.missing || [];
             suggestions = mp.suggestions || [];
+            reason = mp.reason || "";
           }
         } catch (e) {
           console.error("Resume match failed during parsing:", e);
@@ -1357,6 +1641,7 @@ function AddFlight({
         have,
         missing,
         suggestions,
+        reason,
       };
 
       setDraft(nextDraft);
@@ -1534,6 +1819,7 @@ function AddFlight({
           </div>
 
           {resumeText ? (
+            <>
             <div className="match-block">
               <MatchGauge value={draft.match} size={54} />
               <div className="match-details">
@@ -1553,6 +1839,14 @@ function AddFlight({
                 )}
               </div>
             </div>
+
+            {draft.reason && (
+              <div className="match-reason">
+                <span className="mini-label">Why this score</span>
+                <p>{draft.reason}</p>
+              </div>
+            )}
+            </>
           ) : (
             <div className="hint">
               <AlertCircle size={13} /> Add a resume to see a match score for this role.
@@ -1832,6 +2126,7 @@ function ResumeView({
   pushToast,
   onRecalculate,
   recalculating,
+  recalculationProgress,
 }) {
   const [text, setText] = useState(resume.text || "");
   const [saving, setSaving] = useState(false);
@@ -1881,7 +2176,9 @@ function ResumeView({
       {recalculating && (
         <div className="operation-status fade-in">
           <Loader2 className="spin" size={15} />
-          <span>Comparing your resume against all logged applications…</span>
+          <span>
+            Recalculating {recalculationProgress.completed} of {recalculationProgress.total} applications…
+          </span>
         </div>
       )}
 
@@ -1909,7 +2206,9 @@ function ResumeView({
           ) : (
             <RefreshCw size={15} />
           )}
-          {recalculating ? "Recalculating matches…" : "Recalculate all matches"}
+          {recalculating
+            ? `Recalculating ${recalculationProgress.completed}/${recalculationProgress.total}…`
+            : "Recalculate all matches"}
         </button>
       </div>
 
@@ -2192,6 +2491,12 @@ function FlightDrawer({
                     </ul>
                   </Section>
                 )}
+
+                {app.reason && (
+                  <Section title="Why this score">
+                    <p className="match-reason-text">{app.reason}</p>
+                  </Section>
+                )}
               </>
             ) : (
               <div className="hint"><AlertCircle size={13} /> Add a resume to unlock matching and interview prep.</div>
@@ -2424,7 +2729,7 @@ function Style() {
         color:var(--muted);
         padding:8px 14px;
         border-radius:7px;
-        font-size:13px;
+        font-size:13px;F
         font-weight:500;
         cursor:pointer;
         transition:all .15s ease;
@@ -2450,10 +2755,47 @@ function Style() {
       .empty h2{font-family:'Space Grotesk',sans-serif; color:var(--text); font-size:20px; margin:4px 0 0;}
       .empty p{font-size:14px; margin:0 0 8px;}
 
+      /* dashboard statistics */
+      .dashboard-stats{
+        display:grid;
+        grid-template-columns:repeat(6, minmax(0, 1fr));
+        gap:10px;
+        margin-bottom:14px;
+      }
+
+      .stat-card{
+        min-width:0;
+        padding:13px 14px;
+        background:var(--panel);
+        border:1px solid var(--border);
+        border-radius:10px;
+        display:flex;
+        flex-direction:column;
+        gap:5px;
+      }
+
+      .stat-label{
+        color:var(--muted);
+        font-family:'JetBrains Mono',monospace;
+        font-size:9px;
+        letter-spacing:1px;
+        text-transform:uppercase;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+      }
+
+      .stat-value{
+        color:var(--text);
+        font-family:'Space Grotesk',sans-serif;
+        font-size:21px;
+        line-height:1;
+      }
+
       /* dashboard search + filters */
       .dashboard-toolbar{
         display:grid;
-        grid-template-columns:minmax(220px, 1.6fr) minmax(150px, .7fr) minmax(150px, .7fr) auto;
+        grid-template-columns:minmax(230px, 1.5fr) repeat(4, minmax(145px, .75fr)) auto;
         gap:10px;
         align-items:center;
         margin-bottom:18px;
@@ -2528,6 +2870,16 @@ function Style() {
       }
 
       .strip:hover{transform:translateY(-2px); border-color:var(--muted);}
+
+      .strip.deadline-soon{
+        border-color:rgba(232,163,61,0.55);
+        box-shadow:inset 0 0 0 1px rgba(232,163,61,0.08);
+      }
+
+      .strip.overdue{
+        border-color:rgba(217,105,95,0.6);
+        box-shadow:inset 0 0 0 1px rgba(217,105,95,0.08);
+      }
       .strip-tab{width:5px; flex:none;}
       .strip-body{padding:11px 13px; flex:1; min-width:0;}
       .strip-row{display:flex; align-items:center; justify-content:space-between; gap:8px;}
@@ -2535,7 +2887,8 @@ function Style() {
       .strip-position{font-weight:600; font-size:14.5px; margin:3px 0 8px; color:var(--text);}
       .strip-meta{gap:12px; flex-wrap:wrap;}
       .strip-meta-item{display:flex; align-items:center; gap:4px; font-size:11.5px; color:var(--muted);}
-      .strip-meta-item.urgent{color:var(--red);}
+      .strip-meta-item.deadline-soon{color:var(--amber);}
+      .strip-meta-item.overdue{color:var(--red);}
 
       /* gauge */
       .gauge{position:relative; display:flex; align-items:center; justify-content:center; flex:none;}
@@ -2719,6 +3072,22 @@ function Style() {
       .chip-missing{border-color:var(--amber); color:var(--amber);}
       .match-block{display:flex; gap:16px; align-items:flex-start; margin-top:18px; padding-top:16px; border-top:1px dashed var(--border);}
       .match-details{flex:1; display:flex; flex-direction:column; gap:8px;}
+
+      .match-reason{
+        margin-top:12px;
+        padding:12px 13px;
+        border:1px solid var(--border);
+        border-radius:8px;
+        background:rgba(91,141,239,0.05);
+      }
+
+      .match-reason p,
+      .match-reason-text{
+        margin:7px 0 0;
+        color:var(--text);
+        font-size:12.5px;
+        line-height:1.55;
+      }
       .hint{display:flex; align-items:center; gap:7px; color:var(--muted); font-size:12.5px; margin-top:16px;}
       .muted-text{color:var(--muted); font-size:13px;}
       .muted-text.small{font-size:11.5px; margin-top:14px;}
@@ -2882,9 +3251,13 @@ function Style() {
       .toast-success{border-color:var(--teal);}
       .toast-error{border-color:var(--red);}
 
-      @media(max-width:820px){
+      @media(max-width:1100px){
+        .dashboard-stats{
+          grid-template-columns:repeat(3, minmax(0, 1fr));
+        }
+
         .dashboard-toolbar{
-          grid-template-columns:1fr 1fr;
+          grid-template-columns:repeat(3, minmax(0, 1fr));
         }
 
         .dashboard-search-wrap{
@@ -2892,7 +3265,11 @@ function Style() {
         }
       }
 
-      @media(max-width:640px){
+      @media(max-width:700px){
+        .dashboard-stats{
+          grid-template-columns:repeat(2, minmax(0, 1fr));
+        }
+
         .dashboard-toolbar{
           grid-template-columns:1fr;
         }
