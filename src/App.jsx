@@ -685,14 +685,12 @@ return (
               return;
             }
 
-            // Gemini free-tier safe recalculation.
-            // The API limit shown by Gemini is 20 requests/minute, so we avoid
-            // sending multiple match requests at once and space them out.
-            // If a request still fails (for example, a 429 quota response),
-            // wait long enough for the quota window to recover before retrying.
+            // JavaScript equivalent of asyncio-style concurrency:
+            // process a small number of applications in parallel instead of
+            // waiting several seconds between every Gemini request.
+            const CONCURRENCY = 3;
             const MAX_ATTEMPTS = 3;
-            const BETWEEN_APPLICATIONS_MS = 4000;
-            const RATE_LIMIT_RETRY_MS = 45000;
+            const BASE_RETRY_MS = 2500;
 
             const wait = (ms) =>
               new Promise((resolve) => setTimeout(resolve, ms));
@@ -708,6 +706,11 @@ return (
               typeof parsed.reason === "string" &&
               parsed.reason.trim().length > 0;
 
+            const isRateLimitError = (error) =>
+              error?.message?.includes("429") ||
+              error?.status === 429 ||
+              error?.code === 429;
+
             setRecalculating(true);
             setRecalculationProgress({
               completed: 0,
@@ -719,10 +722,11 @@ return (
               const next = [...applications];
               let succeeded = 0;
               let failed = 0;
+              let completed = 0;
+              let nextIndex = 0;
 
-              for (let currentIndex = 0; currentIndex < applications.length; currentIndex += 1) {
+              const processApplication = async (currentIndex) => {
                 const app = applications[currentIndex];
-                let success = false;
                 let lastError = null;
 
                 for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
@@ -762,8 +766,8 @@ return (
                     if (error) throw error;
 
                     next[currentIndex] = updatedApp;
-                    success = true;
-                    break;
+                    succeeded += 1;
+                    return;
                   } catch (error) {
                     lastError = error;
 
@@ -773,38 +777,49 @@ return (
                     );
 
                     if (attempt < MAX_ATTEMPTS) {
-                      pushToast(
-                        `Gemini is busy. Waiting before retrying ${app.company || "this application"}…`,
-                        "info"
-                      );
+                      // Short exponential retry for normal failures.
+                      // Back off more aggressively only for an actual 429.
+                      const retryDelay = isRateLimitError(error)
+                        ? 15000 * attempt
+                        : BASE_RETRY_MS * (2 ** (attempt - 1));
 
-                      await wait(RATE_LIMIT_RETRY_MS);
+                      await wait(retryDelay);
                     }
                   }
                 }
 
-                if (success) {
-                  succeeded += 1;
-                } else {
-                  failed += 1;
-                  console.error(
-                    "Recalculation permanently failed:",
-                    app.id,
-                    lastError
-                  );
-                }
+                failed += 1;
+                console.error(
+                  "Recalculation permanently failed:",
+                  app.id,
+                  lastError
+                );
+              };
 
-                setRecalculationProgress({
-                  completed: currentIndex + 1,
-                  total: applications.length,
-                });
+              const worker = async () => {
+                while (true) {
+                  const currentIndex = nextIndex;
+                  nextIndex += 1;
 
-                // Keep requests comfortably below Gemini's free-tier
-                // per-minute quota. No need to wait after the final item.
-                if (currentIndex < applications.length - 1) {
-                  await wait(BETWEEN_APPLICATIONS_MS);
+                  if (currentIndex >= applications.length) {
+                    return;
+                  }
+
+                  await processApplication(currentIndex);
+
+                  completed += 1;
+                  setRecalculationProgress({
+                    completed,
+                    total: applications.length,
+                  });
                 }
-              }
+              };
+
+              const workerCount = Math.min(CONCURRENCY, applications.length);
+
+              await Promise.all(
+                Array.from({ length: workerCount }, () => worker())
+              );
 
               setApplications(next);
 
