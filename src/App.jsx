@@ -197,6 +197,8 @@ export default function App() {
     completed: 0,
     total: 0,
   });
+  const [recalculationFailures, setRecalculationFailures] = useState([]);
+  const [retryingMatchId, setRetryingMatchId] = useState(null);
   const [passwordRecovery, setPasswordRecovery] = useState(() => {
     const params = new URLSearchParams(window.location.search);
     return params.get("reset") === "1";
@@ -589,6 +591,141 @@ const deleteApplication = useCallback(
   [session, pushToast]
 );
 
+const retryApplicationMatch = useCallback(
+  async (applicationId) => {
+    if (!resume.text || !session?.user?.id) {
+      pushToast("Resume or session is missing.", "error");
+      return false;
+    }
+
+    const app = applications.find((item) => item.id === applicationId);
+
+    if (!app) {
+      pushToast("Couldn't find that application.", "error");
+      return false;
+    }
+
+    const MAX_ATTEMPTS = 3;
+    const BASE_RETRY_MS = 2500;
+
+    const wait = (ms) =>
+      new Promise((resolve) => setTimeout(resolve, ms));
+
+    const isValidMatchResult = (parsed) =>
+      parsed &&
+      Number.isInteger(parsed.match) &&
+      parsed.match >= 0 &&
+      parsed.match <= 100 &&
+      Array.isArray(parsed.have) &&
+      Array.isArray(parsed.missing) &&
+      Array.isArray(parsed.suggestions) &&
+      typeof parsed.reason === "string" &&
+      parsed.reason.trim().length > 0;
+
+    const isRateLimitError = (error) =>
+      error?.message?.includes("429") ||
+      error?.status === 429 ||
+      error?.code === 429;
+
+    setRetryingMatchId(applicationId);
+
+    try {
+      let lastError = null;
+
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+        try {
+          const raw = await callGemini(
+            MATCH_SYSTEM,
+            matchUserPrompt(app, resume.text)
+          );
+
+          const parsed = safeParseJSON(raw);
+
+          if (!isValidMatchResult(parsed)) {
+            throw new Error("Gemini returned an invalid match result.");
+          }
+
+          const updatedApp = {
+            ...app,
+            match: parsed.match,
+            have: parsed.have,
+            missing: parsed.missing,
+            suggestions: parsed.suggestions,
+            reason: parsed.reason.trim(),
+          };
+
+          const { error } = await supabase
+            .from("Applications")
+            .update({
+              match: updatedApp.match,
+              have: updatedApp.have,
+              missing: updatedApp.missing,
+              suggestions: updatedApp.suggestions,
+              reason: updatedApp.reason,
+            })
+            .eq("id", updatedApp.id)
+            .eq("user_id", session.user.id);
+
+          if (error) throw error;
+
+          setApplications((current) =>
+            current.map((item) =>
+              item.id === applicationId ? updatedApp : item
+            )
+          );
+
+          setRecalculationFailures((current) =>
+            current.filter((item) => item.id !== applicationId)
+          );
+
+          pushToast(
+            `Match updated for ${app.company || app.position || "application"}.`,
+            "success"
+          );
+
+          return true;
+        } catch (error) {
+          lastError = error;
+
+          console.error(
+            `Single-match retry attempt ${attempt}/${MAX_ATTEMPTS} failed for ${applicationId}:`,
+            error
+          );
+
+          if (attempt < MAX_ATTEMPTS) {
+            const retryDelay = isRateLimitError(error)
+              ? 15000 * attempt
+              : BASE_RETRY_MS * (2 ** (attempt - 1));
+
+            await wait(retryDelay);
+          }
+        }
+      }
+
+      setRecalculationFailures((current) =>
+        current.map((item) =>
+          item.id === applicationId
+            ? {
+                ...item,
+                error: lastError?.message || "Match recalculation failed.",
+              }
+            : item
+        )
+      );
+
+      pushToast(
+        `Couldn't update ${app.company || app.position || "that application"}.`,
+        "error"
+      );
+
+      return false;
+    } finally {
+      setRetryingMatchId(null);
+    }
+  },
+  [applications, resume.text, session, pushToast]
+);
+
 const selected =
   applications.find((a) => a.id === selectedId) || null;
 
@@ -674,6 +811,9 @@ return (
           pushToast={pushToast}
           recalculating={recalculating}
           recalculationProgress={recalculationProgress}
+          recalculationFailures={recalculationFailures}
+          retryingMatchId={retryingMatchId}
+          onRetryMatch={retryApplicationMatch}
           onRecalculate={async () => {
             if (!resume.text) {
               pushToast("Add a resume first.", "error");
@@ -712,6 +852,7 @@ return (
               error?.code === 429;
 
             setRecalculating(true);
+            setRecalculationFailures([]);
             setRecalculationProgress({
               completed: 0,
               total: applications.length,
@@ -724,6 +865,7 @@ return (
               let failed = 0;
               let completed = 0;
               let nextIndex = 0;
+              const failedApplications = [];
 
               const processApplication = async (currentIndex) => {
                 const app = applications[currentIndex];
@@ -789,6 +931,13 @@ return (
                 }
 
                 failed += 1;
+                failedApplications.push({
+                  id: app.id,
+                  company: app.company || "Unknown company",
+                  position: app.position || "Untitled role",
+                  error: lastError?.message || "Match recalculation failed.",
+                });
+
                 console.error(
                   "Recalculation permanently failed:",
                   app.id,
@@ -822,6 +971,7 @@ return (
               );
 
               setApplications(next);
+              setRecalculationFailures(failedApplications);
 
               if (failed === 0) {
                 pushToast(
@@ -2142,6 +2292,9 @@ function ResumeView({
   onRecalculate,
   recalculating,
   recalculationProgress,
+  recalculationFailures,
+  retryingMatchId,
+  onRetryMatch,
 }) {
   const [text, setText] = useState(resume.text || "");
   const [saving, setSaving] = useState(false);
@@ -2165,7 +2318,8 @@ function ResumeView({
     }
   };
 
-  const busy = saving || recalculating;
+  const retryingFailedMatch = !!retryingMatchId;
+  const busy = saving || recalculating || retryingFailedMatch;
 
   return (
     <div className="panel">
@@ -2194,6 +2348,53 @@ function ResumeView({
           <span>
             Recalculating {recalculationProgress.completed} of {recalculationProgress.total} applications…
           </span>
+        </div>
+      )}
+
+      {recalculationFailures.length > 0 && (
+        <div className="recalculation-failures fade-in">
+          <div className="recalculation-failures-head">
+            <AlertCircle size={16} />
+            <div>
+              <strong>
+                {recalculationFailures.length} match
+                {recalculationFailures.length === 1 ? "" : "es"} need a retry
+              </strong>
+              <p>
+                The other applications were saved successfully. Retry only the failed one below.
+              </p>
+            </div>
+          </div>
+
+          <div className="recalculation-failure-list">
+            {recalculationFailures.map((failure) => {
+              const retryingThis = retryingMatchId === failure.id;
+
+              return (
+                <div className="recalculation-failure-item" key={failure.id}>
+                  <div className="recalculation-failure-copy">
+                    <strong>{failure.company}</strong>
+                    <span>{failure.position}</span>
+                    <small>{failure.error}</small>
+                  </div>
+
+                  <button
+                    className="btn btn-ghost btn-compact"
+                    type="button"
+                    disabled={retryingFailedMatch || recalculating}
+                    onClick={() => onRetryMatch(failure.id)}
+                  >
+                    {retryingThis ? (
+                      <Loader2 className="spin" size={14} />
+                    ) : (
+                      <RefreshCw size={14} />
+                    )}
+                    {retryingThis ? "Retrying…" : "Retry match"}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
 
@@ -3106,6 +3307,76 @@ function Style() {
       .hint{display:flex; align-items:center; gap:7px; color:var(--muted); font-size:12.5px; margin-top:16px;}
       .muted-text{color:var(--muted); font-size:13px;}
       .muted-text.small{font-size:11.5px; margin-top:14px;}
+
+      .recalculation-failures{
+        margin-top:14px;
+        padding:14px;
+        border:1px solid rgba(217,105,95,0.55);
+        border-radius:9px;
+        background:rgba(217,105,95,0.08);
+      }
+
+      .recalculation-failures-head{
+        display:flex;
+        align-items:flex-start;
+        gap:9px;
+        color:var(--red);
+      }
+
+      .recalculation-failures-head strong{
+        display:block;
+        font-size:13.5px;
+        margin-bottom:3px;
+      }
+
+      .recalculation-failures-head p{
+        margin:0;
+        color:var(--muted);
+        font-size:12px;
+        line-height:1.45;
+      }
+
+      .recalculation-failure-list{
+        display:flex;
+        flex-direction:column;
+        gap:8px;
+        margin-top:12px;
+      }
+
+      .recalculation-failure-item{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:12px;
+        padding:10px 11px;
+        border:1px solid var(--border);
+        border-radius:8px;
+        background:var(--panel);
+      }
+
+      .recalculation-failure-copy{
+        min-width:0;
+        display:flex;
+        flex-direction:column;
+        gap:2px;
+      }
+
+      .recalculation-failure-copy strong{
+        color:var(--text);
+        font-size:12.5px;
+      }
+
+      .recalculation-failure-copy span{
+        color:var(--muted);
+        font-size:11.5px;
+      }
+
+      .recalculation-failure-copy small{
+        color:var(--red);
+        font-family:'JetBrains Mono',monospace;
+        font-size:10px;
+        overflow-wrap:anywhere;
+      }
 
       /* drawer */
       .drawer-overlay{
