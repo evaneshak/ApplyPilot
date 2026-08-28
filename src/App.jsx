@@ -42,20 +42,35 @@ function safeParseJSON(raw) {
 }
 
 async function callGemini(system, userText) {
+  if (isOffline()) {
+    throw new Error("offline");
+  }
+
   const geminiUrl = import.meta.env.DEV
     ? "http://localhost:3001/api/gemini"
     : "/api/gemini";
 
-  const response = await fetch(geminiUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      system,
-      userText,
-    }),
-  });
+  let response;
+
+  try {
+    response = await fetch(geminiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        system,
+        userText,
+      }),
+    });
+  } catch (error) {
+    throw new Error(
+      getFriendlyErrorMessage(
+        error,
+        "Couldn't reach the AI service. Try again."
+      )
+    );
+  }
 
   if (!response.ok) {
     throw new Error("Request failed (" + response.status + ")");
@@ -129,6 +144,28 @@ function hasRequiredLocation(value) {
   return parsed.mode === "remote" || !!parsed.city;
 }
 
+function isOffline() {
+  return typeof navigator !== "undefined" && navigator.onLine === false;
+}
+
+function getFriendlyErrorMessage(error, fallback) {
+  if (isOffline()) {
+    return "You're offline. Check your internet connection and try again.";
+  }
+
+  const message = String(error?.message || "").toLowerCase();
+
+  if (
+    message.includes("failed to fetch") ||
+    message.includes("network") ||
+    message.includes("load failed")
+  ) {
+    return "Network connection failed. Check your internet connection and try again.";
+  }
+
+  return fallback;
+}
+
 /* ---------------------------- gauge ---------------------------- */
 function MatchGauge({ value, size = 46 }) {
   if (value === null || value === undefined) {
@@ -199,6 +236,7 @@ export default function App() {
   });
   const [recalculationFailures, setRecalculationFailures] = useState([]);
   const [retryingMatchId, setRetryingMatchId] = useState(null);
+  const [online, setOnline] = useState(() => navigator.onLine);
   const [passwordRecovery, setPasswordRecovery] = useState(() => {
     const params = new URLSearchParams(window.location.search);
     return params.get("reset") === "1";
@@ -219,6 +257,27 @@ export default function App() {
       return null;
     }
   });
+
+  /* ---- browser network status ---- */
+  useEffect(() => {
+    const handleOnline = () => {
+      setOnline(true);
+      pushToast("You're back online.", "success");
+    };
+
+    const handleOffline = () => {
+      setOnline(false);
+      pushToast("You're offline. Some actions are temporarily unavailable.", "error");
+    };
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, [pushToast]);
 
   /* ---- Supabase authentication session ---- */
   useEffect(() => {
@@ -302,39 +361,43 @@ useEffect(() => {
   const loadSupabaseApplications = async () => {
     setLoaded(false);
 
-    const { data, error } = await supabase
-      .from("Applications")
-      .select("*")
-      .order("created_at", { ascending: false });
+    try {
+      const { data, error } = await supabase
+        .from("Applications")
+        .select("*")
+        .order("created_at", { ascending: false });
 
-    if (error) {
+      if (error) throw error;
+
+      const formatted = (data || []).map((app) => ({
+        id: app.id,
+        company: app.company,
+        position: app.position,
+        location: app.location,
+        salary: app.salary,
+        deadline: app.deadline,
+        status: app.status,
+        skills: app.skills || [],
+        rawText: app.raw_text,
+        match: app.match,
+        have: app.have || [],
+        missing: app.missing || [],
+        suggestions: app.suggestions || [],
+        reason: app.reason || "",
+        questions: app.questions || [],
+        createdAt: app.created_at,
+      }));
+
+      setApplications(formatted);
+    } catch (error) {
       console.error("Supabase Applications load failed:", error);
-      pushToast("Couldn't load applications.", "error");
+      pushToast(
+        getFriendlyErrorMessage(error, "Couldn't load applications."),
+        "error"
+      );
+    } finally {
       setLoaded(true);
-      return;
     }
-
-    const formatted = (data || []).map((app) => ({
-      id: app.id,
-      company: app.company,
-      position: app.position,
-      location: app.location,
-      salary: app.salary,
-      deadline: app.deadline,
-      status: app.status,
-      skills: app.skills || [],
-      rawText: app.raw_text,
-      match: app.match,
-      have: app.have || [],
-      missing: app.missing || [],
-      suggestions: app.suggestions || [],
-      reason: app.reason || "",
-      questions: app.questions || [],
-      createdAt: app.created_at,
-    }));
-
-    setApplications(formatted);
-    setLoaded(true);
   };
 
   loadSupabaseApplications();
@@ -346,29 +409,33 @@ useEffect(() => {
   if (!session?.user?.id) return;
 
   const loadSupabaseResume = async () => {
-    const { data, error } = await supabase
-      .from("Resumes")
-      .select("*")
-      .eq("user_id", session.user.id)
-      .limit(1)
-      .maybeSingle();
+    try {
+      const { data, error } = await supabase
+        .from("Resumes")
+        .select("*")
+        .eq("user_id", session.user.id)
+        .limit(1)
+        .maybeSingle();
 
-    if (error) {
+      if (error) throw error;
+
+      if (data) {
+        setResume({
+          text: data.text || "",
+          updatedAt: data.updated_at,
+        });
+      } else {
+        setResume({
+          text: "",
+          updatedAt: null,
+        });
+      }
+    } catch (error) {
       console.error("Supabase resume load failed:", error);
-      pushToast("Couldn't load your resume.", "error");
-      return;
-    }
-
-    if (data) {
-      setResume({
-        text: data.text || "",
-        updatedAt: data.updated_at,
-      });
-    } else {
-      setResume({
-        text: "",
-        updatedAt: null,
-      });
+      pushToast(
+        getFriendlyErrorMessage(error, "Couldn't load your resume."),
+        "error"
+      );
     }
   };
 
@@ -383,35 +450,44 @@ const persistResume = useCallback(
       return false;
     }
 
-    const updatedAt = new Date().toISOString();
-
-    const { error } = await supabase
-      .from("Resumes")
-      .upsert(
-        {
-          user_id: session.user.id,
-          text: next.text,
-          updated_at: updatedAt,
-        },
-        {
-          onConflict: "user_id",
-        }
-      );
-
-    if (error) {
-      console.error("Supabase resume save failed:", error);
-      pushToast("Couldn't save your resume.", "error");
+    if (isOffline()) {
+      pushToast("You're offline. Resume changes were not saved.", "error");
       return false;
     }
 
-    setResume({
-      text: next.text,
-      updatedAt,
-    });
+    const updatedAt = new Date().toISOString();
 
-    console.log("Resume saved to Supabase.");
+    try {
+      const { error } = await supabase
+        .from("Resumes")
+        .upsert(
+          {
+            user_id: session.user.id,
+            text: next.text,
+            updated_at: updatedAt,
+          },
+          {
+            onConflict: "user_id",
+          }
+        );
 
-    return true;
+      if (error) throw error;
+
+      setResume({
+        text: next.text,
+        updatedAt,
+      });
+
+      console.log("Resume saved to Supabase.");
+      return true;
+    } catch (error) {
+      console.error("Supabase resume save failed:", error);
+      pushToast(
+        getFriendlyErrorMessage(error, "Couldn't save your resume."),
+        "error"
+      );
+      return false;
+    }
   },
   [session, pushToast]
 );
@@ -425,9 +501,15 @@ const addApplication = useCallback(
       return false;
     }
 
-    const { data, error } = await supabase
-      .from("Applications")
-      .insert({
+    if (isOffline()) {
+      pushToast("You're offline. Application was not saved.", "error");
+      return false;
+    }
+
+    try {
+      const { data, error } = await supabase
+        .from("Applications")
+        .insert({
         user_id: session.user.id,
         company: app.company,
         position: app.position,
@@ -444,16 +526,12 @@ const addApplication = useCallback(
         reason: app.reason || "",
         questions: app.questions || [],
       })
-      .select()
-      .single();
+        .select()
+        .single();
 
-    if (error) {
-      console.error("Supabase insert failed:", error);
-      pushToast("Couldn't save application.", "error");
-      return false;
-    }
+      if (error) throw error;
 
-    console.log("Supabase application created:", data);
+      console.log("Supabase application created:", data);
 
     const newApplication = {
       id: data.id,
@@ -485,8 +563,16 @@ const addApplication = useCallback(
       "success"
     );
 
-    setView("dashboard");
-    return true;
+      setView("dashboard");
+      return true;
+    } catch (error) {
+      console.error("Supabase insert failed:", error);
+      pushToast(
+        getFriendlyErrorMessage(error, "Couldn't save application."),
+        "error"
+      );
+      return false;
+    }
   },
   [session, pushToast]
 );
@@ -531,13 +617,31 @@ const updateApplication = useCallback(
     if (patch.reason !== undefined) dbPatch.reason = patch.reason;
     if (patch.questions !== undefined) dbPatch.questions = patch.questions;
 
-    const { error } = await supabase
-      .from("Applications")
-      .update(dbPatch)
-      .eq("id", id)
-      .eq("user_id", session.user.id);
+    if (isOffline()) {
+      if (previousApplication) {
+        setApplications((current) =>
+          current.map((app) =>
+            app.id === id ? previousApplication : app
+          )
+        );
+      }
 
-    if (error) {
+      pushToast("You're offline. Previous changes were restored.", "error");
+      return false;
+    }
+
+    try {
+      const { error } = await supabase
+        .from("Applications")
+        .update(dbPatch)
+        .eq("id", id)
+        .eq("user_id", session.user.id);
+
+      if (error) throw error;
+
+      console.log("Supabase application updated:", id, patch);
+      return true;
+    } catch (error) {
       console.error("Supabase update failed:", error);
 
       if (previousApplication) {
@@ -549,14 +653,14 @@ const updateApplication = useCallback(
       }
 
       pushToast(
-        "Couldn't update application. Previous changes were restored.",
+        getFriendlyErrorMessage(
+          error,
+          "Couldn't update application. Previous changes were restored."
+        ),
         "error"
       );
       return false;
     }
-
-    console.log("Supabase application updated:", id, patch);
-    return true;
   },
   [session, pushToast]
 );
@@ -568,25 +672,35 @@ const deleteApplication = useCallback(
       return;
     }
 
-    const { error } = await supabase
-      .from("Applications")
-      .delete()
-      .eq("id", id)
-      .eq("user_id", session.user.id);
-
-    if (error) {
-      console.error("Supabase delete failed:", error);
-      pushToast("Couldn't remove application.", "error");
-      return;
+    if (isOffline()) {
+      pushToast("You're offline. Application was not removed.", "error");
+      return false;
     }
 
-    setApplications((current) =>
-      current.filter((app) => app.id !== id)
-    );
+    try {
+      const { error } = await supabase
+        .from("Applications")
+        .delete()
+        .eq("id", id)
+        .eq("user_id", session.user.id);
 
-    setSelectedId(null);
+      if (error) throw error;
 
-    pushToast("Application removed.", "success");
+      setApplications((current) =>
+        current.filter((app) => app.id !== id)
+      );
+
+      setSelectedId(null);
+      pushToast("Application removed.", "success");
+      return true;
+    } catch (error) {
+      console.error("Supabase delete failed:", error);
+      pushToast(
+        getFriendlyErrorMessage(error, "Couldn't remove application."),
+        "error"
+      );
+      return false;
+    }
   },
   [session, pushToast]
 );
@@ -776,6 +890,13 @@ return (
   <div className="app">
     <Style />
     <TopBar view={view} setView={setView} />
+
+    {!online && (
+      <div className="offline-banner" role="status">
+        <AlertCircle size={15} />
+        <span>You're offline. Changes cannot be saved until your connection returns.</span>
+      </div>
+    )}
 
     <main className="main">
       {!loaded ? (
@@ -2934,6 +3055,19 @@ function Style() {
         white-space:nowrap;
       }
 
+      .offline-banner{
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        gap:8px;
+        padding:9px 14px;
+        background:rgba(217,105,95,0.12);
+        border-bottom:1px solid rgba(217,105,95,0.45);
+        color:var(--red);
+        font-family:'JetBrains Mono',monospace;
+        font-size:11.5px;
+      }
+
       .auth-forgot{
         display:block;
         margin:8px 0 12px auto;
@@ -2963,7 +3097,7 @@ function Style() {
         color:var(--muted);
         padding:8px 14px;
         border-radius:7px;
-        font-size:13px;F
+        font-size:13px;
         font-weight:500;
         cursor:pointer;
         transition:all .15s ease;
