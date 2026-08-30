@@ -90,6 +90,66 @@ function daysLeft(deadline) {
   return diff;
 }
 
+function getDeadlineAlert(deadline) {
+  const dl = daysLeft(deadline);
+
+  if (dl === null) {
+    return {
+      days: null,
+      label: "",
+      className: "",
+    };
+  }
+
+  if (dl < 0) {
+    const overdueDays = Math.abs(dl);
+
+    return {
+      days: dl,
+      label: `Overdue by ${overdueDays} ${overdueDays === 1 ? "day" : "days"}`,
+      className: "overdue",
+    };
+  }
+
+  if (dl === 0) {
+    return {
+      days: dl,
+      label: "Due today",
+      className: "deadline-today",
+    };
+  }
+
+  if (dl === 1) {
+    return {
+      days: dl,
+      label: "Due tomorrow",
+      className: "deadline-tomorrow",
+    };
+  }
+
+  if (dl <= 3) {
+    return {
+      days: dl,
+      label: `${dl} days left`,
+      className: "deadline-soon",
+    };
+  }
+
+  if (dl <= 7) {
+    return {
+      days: dl,
+      label: `${dl} days left`,
+      className: "deadline-week",
+    };
+  }
+
+  return {
+    days: dl,
+    label: "",
+    className: "",
+  };
+}
+
 
 function parseLocationValue(value) {
   const raw = (value || "").trim();
@@ -1598,6 +1658,35 @@ function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
     return sorted;
   };
 
+  const upcomingDeadlines = applications
+    .map((app) => ({
+      app,
+      alert: getDeadlineAlert(app.deadline),
+    }))
+    .filter(({ app, alert }) =>
+      app.deadline &&
+      alert.days !== null &&
+      alert.days <= 7 &&
+      !["offer", "rejected"].includes(app.status)
+    )
+    .sort((a, b) => {
+      const aDays = a.alert.days;
+      const bDays = b.alert.days;
+
+      // Both overdue: closest overdue deadline first.
+      if (aDays < 0 && bDays < 0) {
+        return bDays - aDays;
+      }
+
+      // Overdue always comes before upcoming.
+      if (aDays < 0) return -1;
+      if (bDays < 0) return 1;
+
+      // Upcoming: nearest deadline first.
+      return aDays - bDays;
+    })
+    .slice(0, 5);
+
   const filtersActive =
     !!normalizedSearch ||
     statusFilter !== "all" ||
@@ -1648,6 +1737,42 @@ function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
           </strong>
         </div>
       </div>
+
+      {upcomingDeadlines.length > 0 && (
+        <section className="deadline-center">
+          <div className="deadline-center-head">
+            <div>
+              <span className="mini-label">Deadline reminders</span>
+              <h2>Upcoming deadlines</h2>
+            </div>
+
+            <span className="deadline-center-count">
+              {upcomingDeadlines.length} urgent
+            </span>
+          </div>
+
+          <div className="deadline-center-list">
+            {upcomingDeadlines.map(({ app, alert }) => (
+              <button
+                key={app.id}
+                className={"deadline-reminder " + (alert.className || "")}
+                type="button"
+                onClick={() => onSelect(app.id)}
+              >
+                <div className="deadline-reminder-main">
+                  <strong>{app.position || "Untitled role"}</strong>
+                  <span>{app.company || "Unknown company"}</span>
+                </div>
+
+                <div className="deadline-reminder-meta">
+                  <CalendarClock size={14} />
+                  <span>{alert.label || app.deadline}</span>
+                </div>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
 
       <div className="dashboard-toolbar">
         <div className="dashboard-search-wrap">
@@ -1778,14 +1903,10 @@ function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
 
 function FlightStrip({ app, onSelect }) {
   const meta = STATUS_META[app.status];
-  const dl = daysLeft(app.deadline);
-
-  const deadlineClass =
-    dl !== null && dl < 0
-      ? " overdue"
-      : dl !== null && dl <= 7
-      ? " deadline-soon"
-      : "";
+  const deadlineAlert = getDeadlineAlert(app.deadline);
+  const deadlineClass = deadlineAlert.className
+    ? ` ${deadlineAlert.className}`
+    : "";
 
   return (
     <button
@@ -1812,8 +1933,7 @@ function FlightStrip({ app, onSelect }) {
             <span className={"strip-meta-item" + deadlineClass}>
               <CalendarClock size={11} />
               {app.deadline}
-              {dl !== null && dl >= 0 ? ` · ${dl}d` : ""}
-              {dl !== null && dl < 0 ? " · overdue" : ""}
+              {deadlineAlert.label ? ` · ${deadlineAlert.label}` : ""}
             </span>
           )}
         </div>
@@ -2588,7 +2708,7 @@ function FlightDrawer({
     rawText: app.rawText || "",
   });
 
-  const dl = daysLeft(app.deadline);
+  const deadlineAlert = getDeadlineAlert(app.deadline);
 
   useEffect(() => {
     if (editing) return;
@@ -2795,8 +2915,16 @@ function FlightDrawer({
               {app.location && <span><MapPin size={13} /> {app.location}</span>}
               {app.salary && <span><DollarSign size={13} /> {app.salary}</span>}
               {app.deadline && (
-                <span className={dl !== null && dl <= 5 && dl >= 0 ? "urgent" : ""}>
-                  <CalendarClock size={13} /> {app.deadline}{dl !== null && dl >= 0 ? " · " + dl + " days left" : ""}
+                <span
+                  className={
+                    deadlineAlert.className
+                      ? `deadline-detail ${deadlineAlert.className}`
+                      : ""
+                  }
+                >
+                  <CalendarClock size={13} />
+                  {app.deadline}
+                  {deadlineAlert.label ? ` · ${deadlineAlert.label}` : ""}
                 </span>
               )}
             </div>
@@ -3160,6 +3288,120 @@ function Style() {
         line-height:1;
       }
 
+      /* deadline reminder center */
+      .deadline-center{
+        margin-bottom:16px;
+        padding:15px;
+        border:1px solid var(--border);
+        border-radius:10px;
+        background:rgba(22,37,61,0.72);
+      }
+
+      .deadline-center-head{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:12px;
+        margin-bottom:10px;
+      }
+
+      .deadline-center-head h2{
+        margin:4px 0 0;
+        font-family:'Space Grotesk',sans-serif;
+        font-size:18px;
+        color:var(--text);
+      }
+
+      .deadline-center-count{
+        flex:none;
+        padding:5px 9px;
+        border:1px solid var(--border);
+        border-radius:20px;
+        color:var(--amber);
+        font-family:'JetBrains Mono',monospace;
+        font-size:10.5px;
+      }
+
+      .deadline-center-list{
+        display:grid;
+        grid-template-columns:repeat(5, minmax(0, 1fr));
+        gap:8px;
+      }
+
+      .deadline-reminder{
+        min-width:0;
+        display:flex;
+        flex-direction:column;
+        gap:8px;
+        text-align:left;
+        padding:11px;
+        border:1px solid var(--border);
+        border-radius:8px;
+        background:var(--panel);
+        color:var(--text);
+        cursor:pointer;
+        transition:transform .15s ease, border-color .15s ease, background .15s ease;
+      }
+
+      .deadline-reminder:hover{
+        transform:translateY(-1px);
+        border-color:var(--muted);
+        background:var(--panel-2);
+      }
+
+      .deadline-reminder-main{
+        min-width:0;
+        display:flex;
+        flex-direction:column;
+        gap:3px;
+      }
+
+      .deadline-reminder-main strong{
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+        font-size:12.5px;
+      }
+
+      .deadline-reminder-main span{
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+        color:var(--muted);
+        font-family:'JetBrains Mono',monospace;
+        font-size:9.5px;
+        text-transform:uppercase;
+        letter-spacing:.5px;
+      }
+
+      .deadline-reminder-meta{
+        display:flex;
+        align-items:center;
+        gap:5px;
+        color:var(--amber);
+        font-size:11px;
+        font-weight:600;
+      }
+
+      .deadline-reminder.deadline-today,
+      .deadline-reminder.overdue{
+        border-color:rgba(217,105,95,0.6);
+      }
+
+      .deadline-reminder.deadline-today .deadline-reminder-meta,
+      .deadline-reminder.overdue .deadline-reminder-meta{
+        color:var(--red);
+      }
+
+      .deadline-reminder.deadline-tomorrow{
+        border-color:rgba(232,163,61,0.65);
+      }
+
+      .deadline-reminder.deadline-soon,
+      .deadline-reminder.deadline-week{
+        border-color:rgba(232,163,61,0.35);
+      }
+
       /* dashboard search + filters */
       .dashboard-toolbar{
         display:grid;
@@ -3239,9 +3481,23 @@ function Style() {
 
       .strip:hover{transform:translateY(-2px); border-color:var(--muted);}
 
+      .strip.deadline-today{
+        border-color:rgba(217,105,95,0.8);
+        box-shadow:inset 0 0 0 1px rgba(217,105,95,0.12);
+      }
+
+      .strip.deadline-tomorrow{
+        border-color:rgba(232,163,61,0.75);
+        box-shadow:inset 0 0 0 1px rgba(232,163,61,0.12);
+      }
+
       .strip.deadline-soon{
         border-color:rgba(232,163,61,0.55);
         box-shadow:inset 0 0 0 1px rgba(232,163,61,0.08);
+      }
+
+      .strip.deadline-week{
+        border-color:rgba(232,163,61,0.32);
       }
 
       .strip.overdue{
@@ -3255,8 +3511,11 @@ function Style() {
       .strip-position{font-weight:600; font-size:14.5px; margin:3px 0 8px; color:var(--text);}
       .strip-meta{gap:12px; flex-wrap:wrap;}
       .strip-meta-item{display:flex; align-items:center; gap:4px; font-size:11.5px; color:var(--muted);}
+      .strip-meta-item.deadline-today{color:var(--red); font-weight:600;}
+      .strip-meta-item.deadline-tomorrow{color:var(--amber); font-weight:600;}
       .strip-meta-item.deadline-soon{color:var(--amber);}
-      .strip-meta-item.overdue{color:var(--red);}
+      .strip-meta-item.deadline-week{color:var(--amber);}
+      .strip-meta-item.overdue{color:var(--red); font-weight:600;}
 
       /* gauge */
       .gauge{position:relative; display:flex; align-items:center; justify-content:center; flex:none;}
@@ -3623,7 +3882,16 @@ function Style() {
       .drawer-company{font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin:4px 0 14px;}
       .drawer-meta{display:flex; flex-direction:column; gap:7px; font-size:13px; color:var(--muted); margin-bottom:18px;}
       .drawer-meta span{display:flex; align-items:center; gap:6px;}
-      .drawer-meta .urgent{color:var(--red);}
+      .drawer-meta .deadline-detail.deadline-today,
+      .drawer-meta .deadline-detail.overdue{
+        color:var(--red);
+        font-weight:600;
+      }
+      .drawer-meta .deadline-detail.deadline-tomorrow,
+      .drawer-meta .deadline-detail.deadline-soon,
+      .drawer-meta .deadline-detail.deadline-week{
+        color:var(--amber);
+      }
 
       .stage-track{display:flex; flex-wrap:wrap; gap:6px; margin-bottom:20px;}
 
@@ -3741,6 +4009,10 @@ function Style() {
           grid-template-columns:repeat(3, minmax(0, 1fr));
         }
 
+        .deadline-center-list{
+          grid-template-columns:repeat(2, minmax(0, 1fr));
+        }
+
         .dashboard-toolbar{
           grid-template-columns:repeat(3, minmax(0, 1fr));
         }
@@ -3753,6 +4025,14 @@ function Style() {
       @media(max-width:700px){
         .dashboard-stats{
           grid-template-columns:repeat(2, minmax(0, 1fr));
+        }
+
+        .deadline-center-head{
+          align-items:flex-start;
+        }
+
+        .deadline-center-list{
+          grid-template-columns:1fr;
         }
 
         .dashboard-toolbar{
