@@ -29,7 +29,7 @@ app.post("/api/gemini", async (req, res) => {
       contents: userText,
       config: {
         systemInstruction: system,
-        maxOutputTokens: 1000,
+        maxOutputTokens: 2000,
       },
     });
 
