@@ -2,9 +2,10 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Plane, Radar, CheckCircle2, Plus, Sparkles,
   Loader2, Trash2, RefreshCw, FileText, MapPin,
-  DollarSign, CalendarClock, ArrowLeft, AlertCircle, Wand2, Pencil
+  DollarSign, CalendarClock, ArrowLeft, AlertCircle, Wand2, Pencil, Upload
 } from "lucide-react";
 import { supabase } from "./supabase";
+import { extractPdfText, MAX_PDF_SIZE_BYTES } from "./pdfText";
 
 /* ---------------------------------------------------------------
    ApplyPilot — mission control for a job search.
@@ -2539,6 +2540,9 @@ function ResumeView({
 }) {
   const [text, setText] = useState(resume.text || "");
   const [saving, setSaving] = useState(false);
+  const [extractingPdf, setExtractingPdf] = useState(false);
+  const [pdfError, setPdfError] = useState("");
+  const pdfInputRef = useRef(null);
 
   useEffect(() => setText(resume.text || ""), [resume.text]);
 
@@ -2559,13 +2563,86 @@ function ResumeView({
     }
   };
 
+  const handlePdfUpload = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+
+    if (!file) return;
+
+    setPdfError("");
+
+    if (file.type !== "application/pdf") {
+      setPdfError("Choose a PDF file. Other file types are not supported.");
+      return;
+    }
+
+    if (file.size > MAX_PDF_SIZE_BYTES) {
+      setPdfError("That PDF is larger than 10 MB. Choose a smaller file.");
+      return;
+    }
+
+    setExtractingPdf(true);
+
+    try {
+      const extractedText = await extractPdfText(file);
+      const usableCharacters = extractedText.replace(/[^\p{L}\p{N}]/gu, "");
+
+      if (usableCharacters.length < 20) {
+        setPdfError(
+          "No usable embedded text was found. Scanned or image-only PDFs are not currently supported."
+        );
+        return;
+      }
+
+      setText(extractedText);
+      pushToast("PDF text added. Review it, then save your resume.", "success");
+    } catch (error) {
+      console.error("PDF resume extraction failed:", error);
+      setPdfError("Couldn't read that PDF. Try a different PDF file.");
+    } finally {
+      setExtractingPdf(false);
+    }
+  };
+
   const retryingFailedMatch = !!retryingMatchId;
-  const busy = saving || recalculating || retryingFailedMatch;
+  const busy = saving || recalculating || retryingFailedMatch || extractingPdf;
 
   return (
     <div className="panel">
       <h2 className="panel-title"><FileText size={17} /> Your resume</h2>
-      <p className="panel-sub">Paste your resume as plain text. ApplyPilot compares it against every posting you log so you always see where you stand.</p>
+      <p className="panel-sub">Paste your resume as plain text or import a PDF. ApplyPilot compares the text against every posting you log so you always see where you stand.</p>
+
+      <div className="resume-upload">
+        <input
+          ref={pdfInputRef}
+          className="visually-hidden"
+          type="file"
+          accept="application/pdf,.pdf"
+          onChange={handlePdfUpload}
+          disabled={busy}
+        />
+        <button
+          className="btn btn-ghost"
+          type="button"
+          onClick={() => pdfInputRef.current?.click()}
+          disabled={busy}
+        >
+          {extractingPdf ? (
+            <Loader2 className="spin" size={15} />
+          ) : (
+            <Upload size={15} />
+          )}
+          {extractingPdf ? "Extracting PDF…" : "Import PDF"}
+        </button>
+        <span>PDF only · 10 MB maximum · text is not saved until you choose Save resume</span>
+      </div>
+
+      {pdfError && (
+        <div className="resume-upload-error" role="alert">
+          <AlertCircle size={15} />
+          <span>{pdfError}</span>
+        </div>
+      )}
 
       <textarea
         className="textarea"
@@ -2580,6 +2657,13 @@ function ResumeView({
         <div className="operation-status fade-in">
           <Loader2 className="spin" size={15} />
           <span>Saving your resume…</span>
+        </div>
+      )}
+
+      {extractingPdf && (
+        <div className="operation-status fade-in">
+          <Loader2 className="spin" size={15} />
+          <span>Extracting text from your PDF…</span>
         </div>
       )}
 
@@ -3526,6 +3610,38 @@ function Style() {
       .panel{background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:26px; max-width:760px; margin:0 auto;}
       .panel-title{display:flex; align-items:center; gap:8px; font-family:'Space Grotesk',sans-serif; font-size:19px; margin:0 0 6px; color:var(--amber);}
       .panel-sub{color:var(--muted); font-size:13.5px; margin:0 0 18px; line-height:1.5;}
+
+      .resume-upload{
+        display:flex;
+        align-items:center;
+        gap:10px;
+        flex-wrap:wrap;
+        margin-bottom:12px;
+      }
+
+      .resume-upload > span{
+        color:var(--muted);
+        font-family:'JetBrains Mono',monospace;
+        font-size:10.5px;
+        line-height:1.4;
+      }
+
+      .resume-upload-error{
+        display:flex;
+        align-items:flex-start;
+        gap:7px;
+        margin-bottom:12px;
+        padding:9px 11px;
+        border:1px solid rgba(217,105,95,0.55);
+        border-radius:8px;
+        background:rgba(217,105,95,0.08);
+        color:var(--red);
+        font-size:12px;
+        line-height:1.45;
+      }
+
+      .resume-upload-error svg{flex:none; margin-top:1px;}
+      .visually-hidden{position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0;}
 
       .textarea, .input{
         width:100%;
