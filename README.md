@@ -40,7 +40,7 @@ ApplyPilot is a responsive job application tracker that combines a mission-contr
 
 ## Key features
 
-- Email/password authentication, signup, password recovery, and protected user data through Supabase
+- Email/password authentication, link-based email confirmation, password recovery, and protected user data through Supabase
 - Persistent application and resume storage scoped to each user
 - Saved, Applied, Interview, Offer, and Rejected application workflow
 - AI-assisted extraction of company, role, location, salary, deadline, and skills from pasted job postings
@@ -52,6 +52,8 @@ ApplyPilot is a responsive job application tracker that combines a mission-contr
 - Dashboard statistics, response-rate tracking, and upcoming deadline reminders
 - Application editing, deletion confirmation, and duplicate-application checks
 - Role-specific AI-generated interview questions
+- In-app AI product help with bounded, non-persistent chat history
+- Automatic Gemini retries with exponential backoff and safe error messages
 - Responsive desktop, tablet, and mobile layouts
 - Offline awareness, loading feedback, friendly errors, and toast notifications
 
@@ -112,7 +114,9 @@ applypilot/
 │   ├── supabase.js      # Supabase browser client
 │   └── main.jsx         # React application entry point
 ├── api/
-│   └── gemini.js        # Vercel serverless Gemini API endpoint
+│   ├── _lib/             # Shared retry, error, and help-chat utilities
+│   ├── gemini.js         # Vercel serverless job/resume AI endpoint
+│   └── help-chat.js      # Vercel serverless in-app help endpoint
 ├── server/
 │   └── server.js        # Local Express Gemini API server
 ├── public/              # Static application assets
@@ -145,6 +149,7 @@ Create `.env.local` in the project root:
 ```dotenv
 VITE_SUPABASE_URL=https://your-project.supabase.co
 VITE_SUPABASE_PUBLISHABLE_KEY=your_supabase_publishable_key
+VITE_APP_URL=http://localhost:5173
 ```
 
 Only use a Supabase browser-safe publishable key in variables prefixed with `VITE_`. Access to user data should be enforced with Supabase row-level security.
@@ -177,7 +182,22 @@ In a second terminal, from the project root, start Vite:
 npm run dev
 ```
 
-The frontend uses Vite's default development URL, `http://localhost:5173`. In development it sends Gemini requests to `http://localhost:3001/api/gemini`.
+The frontend uses Vite's default development URL, `http://localhost:5173`. In development it sends Gemini and help-chat requests to the local API at `http://localhost:3001`.
+
+### Supabase authentication setup
+
+ApplyPilot currently uses Supabase's standard confirmation-link signup flow. In the Supabase dashboard:
+
+1. Open **Authentication → Providers → Email** and keep **Confirm email** enabled.
+2. Keep the default **Authentication → Email Templates → Confirm signup** link template that uses `{{ .ConfirmationURL }}`.
+3. Open **Authentication → URL Configuration**. Set **Site URL** to the production ApplyPilot origin and add the production and local password-reset URLs to **Redirect URLs**, for example:
+
+   ```text
+   https://apply-pilot-mu.vercel.app/?reset=1
+   http://localhost:5173/?reset=1
+   ```
+
+New users confirm their account through the Supabase email link, then return to the configured Site URL. The explicit redirect URLs are used by password-reset emails.
 
 ### Available frontend commands
 
@@ -185,6 +205,7 @@ The frontend uses Vite's default development URL, `http://localhost:5173`. In de
 npm run dev      # Start the Vite development server
 npm run build    # Create a production build
 npm run lint     # Run Oxlint
+npm test         # Run retry, error-normalization, and chat-limit tests
 npm run preview  # Preview the production build locally
 ```
 
@@ -195,8 +216,11 @@ The Vercel deployment requires these environment variables:
 ```text
 VITE_SUPABASE_URL
 VITE_SUPABASE_PUBLISHABLE_KEY
+VITE_APP_URL
 GEMINI_API_KEY
 ```
+
+Set `VITE_APP_URL` to the deployed origin (currently `https://apply-pilot-mu.vercel.app`) so password-reset links always return to production. `GEMINI_API_KEY` remains server-side; do not create a `VITE_GEMINI_API_KEY` variable.
 
 Production frontend requests use the serverless endpoint at `api/gemini.js`; the Gemini key remains server-side.
 

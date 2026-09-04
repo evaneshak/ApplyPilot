@@ -2,10 +2,18 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Plane, Radar, CheckCircle2, Plus, Sparkles,
   Loader2, Trash2, RefreshCw, FileText, MapPin,
-  DollarSign, CalendarClock, ArrowLeft, AlertCircle, Wand2, Pencil, Upload
+  DollarSign, CalendarClock, ArrowLeft, AlertCircle, Wand2, Pencil, Upload,
+  MessageCircle, Send, X
 } from "lucide-react";
 import { supabase } from "./supabase";
 import { extractPdfText, MAX_PDF_SIZE_BYTES } from "./pdfText";
+import {
+  AIRequestError,
+  callGemini,
+  callHelpChat,
+  getAIErrorMessage,
+  parseGeminiJson,
+} from "./aiClient";
 
 /* ---------------------------------------------------------------
    ApplyPilot — mission control for a job search.
@@ -26,59 +34,6 @@ const STATUS_META = {
 
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
-
-function safeParseJSON(raw) {
-  if (!raw) return null;
-  let s = raw.trim();
-  s = s.replace(/^```json/i, "").replace(/^```/, "").replace(/```$/, "").trim();
-  const start = s.indexOf("{");
-  const end = s.lastIndexOf("}");
-  if (start !== -1 && end !== -1) s = s.slice(start, end + 1);
-  try {
-    return JSON.parse(s);
-  } catch (e) {
-    return null;
-  }
-}
-
-async function callGemini(system, userText) {
-  if (isOffline()) {
-    throw new Error("offline");
-  }
-
-  const geminiUrl = import.meta.env.DEV
-    ? "http://localhost:3001/api/gemini"
-    : "/api/gemini";
-
-  let response;
-
-  try {
-    response = await fetch(geminiUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        system,
-        userText,
-      }),
-    });
-  } catch (error) {
-    throw new Error(
-      getFriendlyErrorMessage(
-        error,
-        "Couldn't reach the AI service. Try again."
-      )
-    );
-  }
-
-  if (!response.ok) {
-    throw new Error("Request failed (" + response.status + ")");
-  }
-
-  const data = await response.json();
-  return data.text;
 }
 
 function daysLeft(deadline) {
@@ -305,7 +260,7 @@ export default function App() {
   const [jobPostDraft, setJobPostDraft] = useState(() => {
     try {
       return localStorage.getItem("applypilot_job_post_draft") || "";
-    } catch (e) {
+    } catch {
       return "";
     }
   });
@@ -314,7 +269,7 @@ export default function App() {
     try {
       const saved = localStorage.getItem("applypilot_parsed_job_draft");
       return saved ? JSON.parse(saved) : null;
-    } catch (e) {
+    } catch {
       return null;
     }
   });
@@ -592,7 +547,7 @@ const addApplication = useCallback(
 
       if (error) throw error;
 
-      console.log("Supabase application created:", data);
+      console.log("Supabase application created:", { id: data.id });
 
     const newApplication = {
       id: data.id,
@@ -700,7 +655,10 @@ const updateApplication = useCallback(
 
       if (error) throw error;
 
-      console.log("Supabase application updated:", id, patch);
+      console.log("Supabase application updated:", {
+        id,
+        fields: Object.keys(dbPatch),
+      });
       return true;
     } catch (error) {
       console.error("Supabase update failed:", error);
@@ -780,12 +738,6 @@ const retryApplicationMatch = useCallback(
       return false;
     }
 
-    const MAX_ATTEMPTS = 3;
-    const BASE_RETRY_MS = 2500;
-
-    const wait = (ms) =>
-      new Promise((resolve) => setTimeout(resolve, ms));
-
     const isValidMatchResult = (parsed) =>
       parsed &&
       Number.isInteger(parsed.match) &&
@@ -797,84 +749,69 @@ const retryApplicationMatch = useCallback(
       typeof parsed.reason === "string" &&
       parsed.reason.trim().length > 0;
 
-    const isRateLimitError = (error) =>
-      error?.message?.includes("429") ||
-      error?.status === 429 ||
-      error?.code === 429;
-
     setRetryingMatchId(applicationId);
 
     try {
       let lastError = null;
 
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-        try {
-          const raw = await callGemini(
-            MATCH_SYSTEM,
-            matchUserPrompt(app, resume.text)
-          );
+      try {
+        const raw = await callGemini(
+          MATCH_SYSTEM,
+          matchUserPrompt(app, resume.text)
+        );
 
-          const parsed = safeParseJSON(raw);
+        const parsed = parseGeminiJson(raw);
 
-          if (!isValidMatchResult(parsed)) {
-            throw new Error("Gemini returned an invalid match result.");
-          }
-
-          const updatedApp = {
-            ...app,
-            match: parsed.match,
-            have: parsed.have,
-            missing: parsed.missing,
-            suggestions: parsed.suggestions,
-            reason: parsed.reason.trim(),
-          };
-
-          const { error } = await supabase
-            .from("Applications")
-            .update({
-              match: updatedApp.match,
-              have: updatedApp.have,
-              missing: updatedApp.missing,
-              suggestions: updatedApp.suggestions,
-              reason: updatedApp.reason,
-            })
-            .eq("id", updatedApp.id)
-            .eq("user_id", session.user.id);
-
-          if (error) throw error;
-
-          setApplications((current) =>
-            current.map((item) =>
-              item.id === applicationId ? updatedApp : item
-            )
-          );
-
-          setRecalculationFailures((current) =>
-            current.filter((item) => item.id !== applicationId)
-          );
-
-          pushToast(
-            `Match updated for ${app.company || app.position || "application"}.`,
-            "success"
-          );
-
-          return true;
-        } catch (error) {
-          lastError = error;
-
-          console.error(
-            `Single-match retry attempt ${attempt}/${MAX_ATTEMPTS} failed for ${applicationId}:`,
-            error
-          );
-
-          if (attempt < MAX_ATTEMPTS) {
-            const retryDelay = isRateLimitError(error)
-              ? 15000 * attempt
-              : BASE_RETRY_MS * (2 ** (attempt - 1));
-
-            await wait(retryDelay);
-          }
+        if (!isValidMatchResult(parsed)) {
+          throw new AIRequestError("AI_INVALID_RESPONSE");
         }
+
+        const updatedApp = {
+          ...app,
+          match: parsed.match,
+          have: parsed.have,
+          missing: parsed.missing,
+          suggestions: parsed.suggestions,
+          reason: parsed.reason.trim(),
+        };
+
+        const { error } = await supabase
+          .from("Applications")
+          .update({
+            match: updatedApp.match,
+            have: updatedApp.have,
+            missing: updatedApp.missing,
+            suggestions: updatedApp.suggestions,
+            reason: updatedApp.reason,
+          })
+          .eq("id", updatedApp.id)
+          .eq("user_id", session.user.id);
+
+        if (error) throw error;
+
+        setApplications((current) =>
+          current.map((item) =>
+            item.id === applicationId ? updatedApp : item
+          )
+        );
+
+        setRecalculationFailures((current) =>
+          current.filter((item) => item.id !== applicationId)
+        );
+
+        pushToast(
+          `Match updated for ${app.company || app.position || "application"}.`,
+          "success"
+        );
+
+        return true;
+      } catch (error) {
+        lastError = error;
+        console.error("Single-match recalculation failed:", {
+          applicationId,
+          code: error?.code || "UNKNOWN",
+          status: error?.status || null,
+        });
       }
 
       setRecalculationFailures((current) =>
@@ -968,7 +905,6 @@ return (
       ) : view === "dashboard" ? (
         <Dashboard
           applications={applications}
-          hasResume={!!resume.text}
           onSelect={setSelectedId}
           onGoAdd={() => setView("add")}
         />
@@ -1011,12 +947,6 @@ return (
             // process a small number of applications in parallel instead of
             // waiting several seconds between every Gemini request.
             const CONCURRENCY = 3;
-            const MAX_ATTEMPTS = 3;
-            const BASE_RETRY_MS = 2500;
-
-            const wait = (ms) =>
-              new Promise((resolve) => setTimeout(resolve, ms));
-
             const isValidMatchResult = (parsed) =>
               parsed &&
               Number.isInteger(parsed.match) &&
@@ -1027,11 +957,6 @@ return (
               Array.isArray(parsed.suggestions) &&
               typeof parsed.reason === "string" &&
               parsed.reason.trim().length > 0;
-
-            const isRateLimitError = (error) =>
-              error?.message?.includes("429") ||
-              error?.status === 429 ||
-              error?.code === 429;
 
             setRecalculating(true);
             setRecalculationFailures([]);
@@ -1053,63 +978,51 @@ return (
                 const app = applications[currentIndex];
                 let lastError = null;
 
-                for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-                  try {
-                    const raw = await callGemini(
-                      MATCH_SYSTEM,
-                      matchUserPrompt(app, resume.text)
-                    );
+                try {
+                  const raw = await callGemini(
+                    MATCH_SYSTEM,
+                    matchUserPrompt(app, resume.text)
+                  );
 
-                    const parsed = safeParseJSON(raw);
+                  const parsed = parseGeminiJson(raw);
 
-                    if (!isValidMatchResult(parsed)) {
-                      throw new Error("Gemini returned an invalid match result.");
-                    }
-
-                    const updatedApp = {
-                      ...app,
-                      match: parsed.match,
-                      have: parsed.have,
-                      missing: parsed.missing,
-                      suggestions: parsed.suggestions,
-                      reason: parsed.reason.trim(),
-                    };
-
-                    const { error } = await supabase
-                      .from("Applications")
-                      .update({
-                        match: updatedApp.match,
-                        have: updatedApp.have,
-                        missing: updatedApp.missing,
-                        suggestions: updatedApp.suggestions,
-                        reason: updatedApp.reason,
-                      })
-                      .eq("id", updatedApp.id)
-                      .eq("user_id", session.user.id);
-
-                    if (error) throw error;
-
-                    next[currentIndex] = updatedApp;
-                    succeeded += 1;
-                    return;
-                  } catch (error) {
-                    lastError = error;
-
-                    console.error(
-                      `Recalculation attempt ${attempt}/${MAX_ATTEMPTS} failed for application ${app.id}:`,
-                      error
-                    );
-
-                    if (attempt < MAX_ATTEMPTS) {
-                      // Short exponential retry for normal failures.
-                      // Back off more aggressively only for an actual 429.
-                      const retryDelay = isRateLimitError(error)
-                        ? 15000 * attempt
-                        : BASE_RETRY_MS * (2 ** (attempt - 1));
-
-                      await wait(retryDelay);
-                    }
+                  if (!isValidMatchResult(parsed)) {
+                    throw new AIRequestError("AI_INVALID_RESPONSE");
                   }
+
+                  const updatedApp = {
+                    ...app,
+                    match: parsed.match,
+                    have: parsed.have,
+                    missing: parsed.missing,
+                    suggestions: parsed.suggestions,
+                    reason: parsed.reason.trim(),
+                  };
+
+                  const { error } = await supabase
+                    .from("Applications")
+                    .update({
+                      match: updatedApp.match,
+                      have: updatedApp.have,
+                      missing: updatedApp.missing,
+                      suggestions: updatedApp.suggestions,
+                      reason: updatedApp.reason,
+                    })
+                    .eq("id", updatedApp.id)
+                    .eq("user_id", session.user.id);
+
+                  if (error) throw error;
+
+                  next[currentIndex] = updatedApp;
+                  succeeded += 1;
+                  return;
+                } catch (error) {
+                  lastError = error;
+                  console.error("Match recalculation failed:", {
+                    applicationId: app.id,
+                    code: error?.code || "UNKNOWN",
+                    status: error?.status || null,
+                  });
                 }
 
                 failed += 1;
@@ -1202,11 +1115,52 @@ return (
       />
     )}
 
+    <HelpChat hidden={!!selected} />
     <Toasts toasts={toasts} />
   </div>
 );
 }
 
+
+function getAuthErrorMessage(error, context = "auth") {
+  if (isOffline()) return "You're offline. Check your connection and try again.";
+
+  const message = String(error?.message || "").toLowerCase();
+  const status = error?.status;
+
+  if (
+    status === 429 ||
+    message.includes("rate limit") ||
+    message.includes("too many")
+  ) {
+    return "Too many attempts. Please wait and try again.";
+  }
+
+  if (message.includes("already registered") || message.includes("already exists")) {
+    return "An account with that email already exists. Try signing in.";
+  }
+
+  if (message.includes("weak password") || message.includes("password should")) {
+    return "Use a stronger password and try again.";
+  }
+
+  if (message.includes("invalid login credentials")) {
+    return "Email or password is incorrect.";
+  }
+
+  if (
+    message.includes("fetch") ||
+    message.includes("network") ||
+    message.includes("load failed")
+  ) {
+    return "Network connection failed. Check your connection and try again.";
+  }
+
+  if (context === "signup") return "Couldn't create your account. Please try again.";
+  if (context === "reset") return "Couldn't send the password reset email.";
+  if (context === "password") return "Couldn't update your password. Please try again.";
+  return "Authentication failed. Please try again.";
+}
 
 function AuthView({ pushToast }) {
   const [mode, setMode] = useState("login");
@@ -1226,20 +1180,21 @@ function AuthView({ pushToast }) {
 
     try {
       if (mode === "signup") {
+        const cleanEmail = email.trim();
         const { error } = await supabase.auth.signUp({
-          email,
+          email: cleanEmail,
           password,
         });
 
         if (error) throw error;
 
         pushToast(
-          "Account created. Check your email if confirmation is required.",
+          "Account created. Check your email for the confirmation link.",
           "success"
         );
       } else {
         const { error } = await supabase.auth.signInWithPassword({
-          email,
+          email: email.trim(),
           password,
         });
 
@@ -1248,7 +1203,7 @@ function AuthView({ pushToast }) {
         pushToast("Welcome back.", "success");
       }
     } catch (error) {
-      pushToast(error.message || "Authentication failed.", "error");
+      pushToast(getAuthErrorMessage(error, mode), "error");
     } finally {
       setLoading(false);
     }
@@ -1263,7 +1218,8 @@ function AuthView({ pushToast }) {
     setLoading(true);
 
     try {
-      const redirectTo = `${window.location.origin}/?reset=1`;
+      const configuredAppUrl = import.meta.env.VITE_APP_URL?.replace(/\/$/, "");
+      const redirectTo = `${configuredAppUrl || window.location.origin}/?reset=1`;
 
       const { error } = await supabase.auth.resetPasswordForEmail(
         email.trim(),
@@ -1277,10 +1233,7 @@ function AuthView({ pushToast }) {
         "success"
       );
     } catch (error) {
-      pushToast(
-        error.message || "Couldn't send password reset email.",
-        "error"
-      );
+      pushToast(getAuthErrorMessage(error, "reset"), "error");
     } finally {
       setLoading(false);
     }
@@ -1321,6 +1274,8 @@ function AuthView({ pushToast }) {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder="you@example.com"
+              autoComplete="email"
+              required
             />
           </label>
 
@@ -1332,6 +1287,8 @@ function AuthView({ pushToast }) {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="••••••••"
+              autoComplete={mode === "signup" ? "new-password" : "current-password"}
+              required
             />
           </label>
 
@@ -1405,7 +1362,7 @@ function PasswordResetView({ pushToast, onComplete }) {
       await onComplete();
     } catch (error) {
       pushToast(
-        error.message || "Couldn't update your password.",
+        getAuthErrorMessage(error, "password"),
         "error"
       );
     } finally {
@@ -1532,7 +1489,7 @@ function TopBar({ view, setView }) {
 }
 
 /* --------------------------- dashboard --------------------------- */
-function Dashboard({ applications, hasResume, onSelect, onGoAdd }) {
+function Dashboard({ applications, onSelect, onGoAdd }) {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [locationFilter, setLocationFilter] = useState("all");
@@ -2004,7 +1961,7 @@ function AddFlight({
 
     try {
       const raw = await callGemini(EXTRACT_SYSTEM, text);
-      const parsed = safeParseJSON(raw);
+      const parsed = parseGeminiJson(raw);
 
       if (!parsed) {
         throw new Error("parse-failed");
@@ -2025,7 +1982,7 @@ function AddFlight({
             matchUserPrompt({ ...parsed, rawText: text }, resumeText)
           );
 
-          const mp = safeParseJSON(mraw);
+          const mp = parseGeminiJson(mraw);
 
           if (mp) {
             match = mp.match;
@@ -2034,8 +1991,15 @@ function AddFlight({
             suggestions = mp.suggestions || [];
             reason = mp.reason || "";
           }
-        } catch (e) {
-          console.error("Resume match failed during parsing:", e);
+        } catch (error) {
+          console.error("Resume match failed during parsing:", {
+            code: error?.code || "UNKNOWN",
+            status: error?.status || null,
+          });
+          pushToast(
+            `${getAIErrorMessage(error)} The posting was still parsed.`,
+            "error"
+          );
         } finally {
           setMatching(false);
         }
@@ -2053,8 +2017,11 @@ function AddFlight({
 
       setDraft(nextDraft);
       onDraftChange(nextDraft);
-    } catch (e) {
-      pushToast("Couldn't read that posting. Try pasting it again.", "error");
+    } catch (error) {
+      pushToast(
+        getAIErrorMessage(error, "Couldn't analyze that posting. Please try again."),
+        "error"
+      );
     } finally {
       setParsing(false);
       setMatching(false);
@@ -2880,11 +2847,16 @@ function FlightDrawer({
         (app.rawText ? "\nJOB POSTING:\n" + app.rawText : "") +
         "\n\nCANDIDATE RESUME:\n" + (resumeText || "Not provided.");
       const raw = await callGemini(INTERVIEW_SYSTEM, prompt);
-      const parsed = safeParseJSON(raw);
-      if (!parsed || !parsed.questions) throw new Error("bad-response");
+      const parsed = parseGeminiJson(raw);
+      if (!Array.isArray(parsed.questions) || parsed.questions.length === 0) {
+        throw new AIRequestError("AI_INVALID_RESPONSE");
+      }
       onQuestions(parsed.questions);
-    } catch (e) {
-      pushToast("Couldn't generate questions — try again.", "error");
+    } catch (error) {
+      pushToast(
+        getAIErrorMessage(error, "Couldn't generate questions. Please try again."),
+        "error"
+      );
     } finally {
       setGenLoading(false);
     }
@@ -3162,6 +3134,207 @@ function Toasts({ toasts }) {
           <span>{t.message}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+/* -------------------------- help chat ----------------------------- */
+const HELP_GREETING =
+  "Hi — I can help you use ApplyPilot. Ask me how to log applications, manage your resume, understand match scores, or navigate the dashboard.";
+
+const HELP_STARTERS = [
+  "How do I log an application?",
+  "What does my match score mean?",
+  "How do I update an application status?",
+  "How does resume matching work?",
+];
+
+function HelpChat({ hidden = false }) {
+  const [open, setOpen] = useState(false);
+  const [input, setInput] = useState("");
+  const [pending, setPending] = useState(false);
+  const [messages, setMessages] = useState([
+    { id: "greeting", role: "assistant", content: HELP_GREETING },
+  ]);
+  const messageEndRef = useRef(null);
+  const inputRef = useRef(null);
+  const launcherRef = useRef(null);
+
+  useEffect(() => {
+    if (hidden) setOpen(false);
+  }, [hidden]);
+
+  useEffect(() => {
+    if (!open) return;
+    messageEndRef.current?.scrollIntoView({ block: "end" });
+  }, [messages, pending, open]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    inputRef.current?.focus();
+
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+        launcherRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [open]);
+
+  const sendQuestion = async (question) => {
+    const cleanQuestion = String(question || "").trim();
+    if (!cleanQuestion || pending) return;
+
+    const userMessage = { id: uid(), role: "user", content: cleanQuestion };
+    const nextMessages = [...messages, userMessage];
+    setMessages(nextMessages.slice(-30));
+    setInput("");
+    setPending(true);
+
+    try {
+      const recentMessages = nextMessages
+        .filter((message) => message.id !== "greeting")
+        .slice(-8);
+      const boundedMessages = [];
+      let totalLength = 0;
+
+      for (let index = recentMessages.length - 1; index >= 0; index -= 1) {
+        const message = recentMessages[index];
+        if (totalLength + message.content.length > 4000) break;
+        boundedMessages.unshift(message);
+        totalLength += message.content.length;
+      }
+
+      const answer = await callHelpChat(
+        boundedMessages.map(({ role, content }) => ({ role, content }))
+      );
+      setMessages((current) => [
+        ...current,
+        { id: uid(), role: "assistant", content: answer },
+      ].slice(-30));
+    } catch (error) {
+      const message = error?.code === "AI_RATE_LIMITED"
+        ? "The help assistant has reached its request limit. Please wait a moment and try again."
+        : "Help assistant is temporarily unavailable. Please try again.";
+      setMessages((current) => [
+        ...current,
+        { id: uid(), role: "assistant", content: message, error: true },
+      ].slice(-30));
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <div
+      className={`help-chat-root${hidden ? " help-chat-root-hidden" : ""}`}
+      aria-hidden={hidden || undefined}
+    >
+      {open && (
+        <section className="help-chat-panel" aria-label="ApplyPilot help assistant">
+          <header className="help-chat-head">
+            <div>
+              <span className="mini-label">AI help assistant</span>
+              <strong>Ask ApplyPilot</strong>
+            </div>
+            <button
+              className="icon-btn"
+              type="button"
+              aria-label="Close help assistant"
+              onClick={() => {
+                setOpen(false);
+                launcherRef.current?.focus();
+              }}
+            >
+              <X size={17} />
+            </button>
+          </header>
+
+          <div className="help-chat-messages" aria-live="polite">
+            {messages.map((message) => (
+              <div
+                key={message.id}
+                className={`help-message help-message-${message.role}${message.error ? " help-message-error" : ""}`}
+              >
+                {message.content}
+              </div>
+            ))}
+
+            {messages.length === 1 && (
+              <div className="help-starters" aria-label="Suggested questions">
+                {HELP_STARTERS.map((starter) => (
+                  <button
+                    key={starter}
+                    type="button"
+                    onClick={() => sendQuestion(starter)}
+                    disabled={pending}
+                  >
+                    {starter}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {pending && (
+              <div className="help-message help-message-assistant help-message-loading" role="status">
+                <Loader2 className="spin" size={14} /> Thinking…
+              </div>
+            )}
+            <div ref={messageEndRef} />
+          </div>
+
+          <form
+            className="help-chat-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              sendQuestion(input);
+            }}
+          >
+            <label className="visually-hidden" htmlFor="applypilot-help-input">
+              Ask a question about ApplyPilot
+            </label>
+            <textarea
+              ref={inputRef}
+              id="applypilot-help-input"
+              className="help-chat-input"
+              rows={2}
+              maxLength={1000}
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  sendQuestion(input);
+                }
+              }}
+              placeholder="Ask how ApplyPilot works…"
+              disabled={pending}
+            />
+            <button
+              className="help-send"
+              type="submit"
+              aria-label="Send help question"
+              disabled={pending || !input.trim()}
+            >
+              {pending ? <Loader2 className="spin" size={17} /> : <Send size={17} />}
+            </button>
+          </form>
+        </section>
+      )}
+
+      <button
+        ref={launcherRef}
+        className={`help-chat-launcher${open ? " help-chat-launcher-open" : ""}`}
+        type="button"
+        aria-label={open ? "Close help assistant" : "Open help assistant"}
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        {open ? <X size={21} /> : <MessageCircle size={21} />}
+        <span>{open ? "Close" : "Help"}</span>
+      </button>
     </div>
   );
 }
@@ -4167,7 +4340,7 @@ function Style() {
 
       .toast-wrap{
         position:fixed;
-        bottom:20px;
+        bottom:82px;
         right:20px;
         display:flex;
         flex-direction:column;
@@ -4197,6 +4370,121 @@ function Style() {
 
       .toast-success{border-color:var(--teal);}
       .toast-error{border-color:var(--red);}
+
+      /* help assistant */
+      .help-chat-root{position:fixed; right:20px; bottom:20px; z-index:70;}
+      .help-chat-root-hidden{visibility:hidden; pointer-events:none;}
+      .help-chat-launcher{
+        margin-left:auto;
+        min-height:46px;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        gap:8px;
+        padding:10px 15px;
+        border:1px solid rgba(232,163,61,.75);
+        border-radius:24px;
+        background:var(--amber);
+        color:#1a1206;
+        font-size:13px;
+        font-weight:700;
+        cursor:pointer;
+        box-shadow:0 12px 28px rgba(4,10,20,.4);
+        transition:transform .15s ease, background .15s ease;
+      }
+      .help-chat-launcher:hover{transform:translateY(-1px); background:#F0AE49;}
+      .help-chat-panel{
+        width:min(370px, calc(100vw - 28px));
+        height:min(520px, calc(100dvh - 110px));
+        margin-bottom:10px;
+        display:flex;
+        flex-direction:column;
+        overflow:hidden;
+        border:1px solid var(--border);
+        border-radius:13px;
+        background:var(--panel);
+        box-shadow:0 22px 54px rgba(4,10,20,.48);
+        animation:fadeIn .2s ease;
+      }
+      .help-chat-head{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:12px;
+        padding:14px 15px;
+        border-bottom:1px solid var(--border);
+        background:var(--panel-2);
+      }
+      .help-chat-head > div{display:flex; flex-direction:column; gap:2px;}
+      .help-chat-head strong{font-family:'Space Grotesk',sans-serif; font-size:16px;}
+      .help-chat-messages{
+        flex:1;
+        min-height:0;
+        display:flex;
+        flex-direction:column;
+        gap:9px;
+        overflow-y:auto;
+        padding:14px;
+        overscroll-behavior:contain;
+      }
+      .help-message{
+        max-width:88%;
+        padding:9px 11px;
+        border:1px solid var(--border);
+        border-radius:10px;
+        color:var(--text);
+        font-size:12.5px;
+        line-height:1.48;
+        white-space:pre-wrap;
+        overflow-wrap:anywhere;
+      }
+      .help-message-assistant{align-self:flex-start; background:var(--panel-2); border-bottom-left-radius:3px;}
+      .help-message-user{align-self:flex-end; background:rgba(232,163,61,.13); border-color:rgba(232,163,61,.5); border-bottom-right-radius:3px;}
+      .help-message-error{border-color:rgba(217,105,95,.65); color:#f0b0aa;}
+      .help-message-loading{display:flex; align-items:center; gap:7px; color:var(--muted);}
+      .help-starters{display:flex; flex-direction:column; align-items:flex-start; gap:6px; margin-top:2px;}
+      .help-starters button{
+        padding:7px 9px;
+        border:1px solid var(--border);
+        border-radius:16px;
+        background:transparent;
+        color:var(--muted);
+        text-align:left;
+        font-size:11.5px;
+        cursor:pointer;
+      }
+      .help-starters button:hover:not(:disabled){border-color:var(--amber); color:var(--amber);}
+      .help-starters button:disabled{opacity:.55; cursor:not-allowed;}
+      .help-chat-form{display:flex; align-items:flex-end; gap:8px; padding:11px; border-top:1px solid var(--border); background:rgba(15,27,46,.65);}
+      .help-chat-input{
+        flex:1;
+        min-width:0;
+        max-height:90px;
+        resize:none;
+        padding:9px 10px;
+        border:1px solid var(--border);
+        border-radius:8px;
+        background:var(--bg);
+        color:var(--text);
+        font-size:13px;
+        line-height:1.4;
+      }
+      .help-chat-input:focus{border-color:var(--amber); outline:none; box-shadow:0 0 0 3px rgba(232,163,61,.08);}
+      .help-chat-input:disabled{opacity:.65;}
+      .help-send{
+        width:40px;
+        height:40px;
+        flex:none;
+        display:grid;
+        place-items:center;
+        padding:0;
+        border:0;
+        border-radius:8px;
+        background:var(--amber);
+        color:#1a1206;
+        cursor:pointer;
+      }
+      .help-send:disabled{opacity:.5; cursor:not-allowed;}
 
       @media(max-width:1100px){
         .dashboard-stats{
@@ -4295,8 +4583,23 @@ function Style() {
 
         .drawer{width:100%; height:100dvh; padding:18px 16px max(18px, env(safe-area-inset-bottom)); border-left:0;}
 
-        .toast-wrap{left:14px; right:14px; bottom:max(14px, env(safe-area-inset-bottom));}
+        .toast-wrap{left:14px; right:14px; bottom:max(76px, calc(env(safe-area-inset-bottom) + 64px));}
         .toast{width:100%; max-width:none;}
+
+        .help-chat-root{right:14px; bottom:max(14px, env(safe-area-inset-bottom));}
+        .help-chat-panel{
+          position:fixed;
+          inset:0;
+          width:100%;
+          height:100dvh;
+          margin:0;
+          border:0;
+          border-radius:0;
+        }
+        .help-chat-launcher-open{display:none;}
+        .help-chat-head{padding-top:max(14px, env(safe-area-inset-top));}
+        .help-chat-form{padding-bottom:max(11px, env(safe-area-inset-bottom));}
+        .help-chat-input{font-size:16px;}
 
         .topbar{padding:14px 16px;}
         .main{padding:18px 14px;}
@@ -4329,6 +4632,7 @@ function Style() {
 
         .delete-confirm-actions .btn,
         .duplicate-warning-actions .btn{width:100%; justify-content:center;}
+
       }
     `}</style>
   );
