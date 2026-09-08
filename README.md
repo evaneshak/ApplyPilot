@@ -1,12 +1,24 @@
 # ApplyPilot
 
-ApplyPilot is a responsive job application tracker that combines a mission-control workflow with AI-assisted job parsing, resume matching, and interview preparation.
+ApplyPilot is a responsive job-search workspace with application tracking, AI-assisted job imports, multiple resumes, role preparation, reminders, and insights.
+
+## ApplyPilot v2
+
+The v2 UI uses a light teal-and-yellow design inspired by the supplied reference. See the [implementation and deployment report](docs/APPLYPILOT_V2.md) for features, validation, limitations, and the complete smoke checklist.
+
+Before deploying v2, run [001_applypilot_v2.sql](docs/migrations/001_applypilot_v2.sql). It preserves the existing tables and copies each saved resume into a default Primary Resume profile. The live migration and production deployment have not been performed by this change. Read the [final migration safety review](docs/MIGRATION_SAFETY_REVIEW.md) before applying the SQL; it documents repeat-run safeguards, ownership checks, and local startup requirements.
 
 ## Live demo
 
 **Production URL:** https://apply-pilot-mu.vercel.app
 
 ## Screenshots
+
+### ApplyPilot v2 overview
+
+![ApplyPilot v2 overview with synthetic verification data](docs/screenshots/v2-overview-desktop.png)
+
+The v2 capture uses synthetic browser-test data. The remaining screenshots below show the previous UI.
 
 ### Dashboard
 
@@ -123,7 +135,7 @@ applypilot/
 └── vite.config.js       # Vite configuration
 ```
 
-Supabase provides authentication plus persistent `Applications` and `Resumes` data. Database schema and row-level security configuration are managed in Supabase and are not currently included as repository migrations.
+Supabase provides authentication plus persistent `Applications` and `Resumes` data. The legacy schema and policies are managed in Supabase. The additive v2 migration is in `docs/migrations/001_applypilot_v2.sql`; it requires the existing application table and enabled RLS.
 
 ## Local development
 
@@ -238,6 +250,4 @@ ApplyPilot is a functional, deployed portfolio project with authenticated persis
 
 ## Potential future improvements
 
-- Multiple resume profiles for different role types
-- Additional job-search analytics
 - Optional calendar or notification integrations for deadlines

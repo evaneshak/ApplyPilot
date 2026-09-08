@@ -1,7 +1,5 @@
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import pdfWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 export const MAX_PDF_SIZE_BYTES = 10 * 1024 * 1024;
 
@@ -41,6 +39,8 @@ async function getTextContentSafariSafe(page) {
 }
 
 export async function extractPdfText(file) {
+  const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
   const data = new Uint8Array(await file.arrayBuffer());
 
   const loadingTask = pdfjsLib.getDocument({

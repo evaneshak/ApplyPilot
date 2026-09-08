@@ -1,4 +1,5 @@
 import express from "express";
+import importJobHandler from "../api/import-job.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
@@ -14,6 +15,7 @@ import {
 } from "../api/_lib/helpChat.js";
 
 dotenv.config();
+dotenv.config({path:new URL("../.env.local", import.meta.url).pathname});
 
 const app = express();
 
@@ -23,6 +25,8 @@ app.use(express.json({ limit: "2mb" }));
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
 });
+
+app.post("/api/import-job", importJobHandler);
 
 app.post("/api/gemini", async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
